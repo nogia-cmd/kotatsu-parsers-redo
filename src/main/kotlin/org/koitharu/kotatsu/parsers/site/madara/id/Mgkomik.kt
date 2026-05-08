@@ -24,6 +24,7 @@ internal class Mgkomik(context: MangaLoaderContext) :
 	override val stylePage = ""
 	override val sourceLocale: Locale = Locale.ENGLISH
     override val withoutAjax = true
+    override val postReq = true
 	private val randomLength = Random.Default.nextInt(13, 21)
 	private val randomString = generateRandomString(randomLength)
 	override fun getRequestHeaders(): Headers = Headers.Builder()

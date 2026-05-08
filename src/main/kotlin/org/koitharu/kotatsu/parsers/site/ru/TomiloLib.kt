@@ -389,18 +389,38 @@ internal class TomiloLib(context: MangaLoaderContext) :
 	}
 
 	private fun resolvePageUrl(path: String): String {
-		return when {
-			path.startsWith("http://", ignoreCase = true) || path.startsWith("https://", ignoreCase = true) -> path
-			path.startsWith("/uploads/titles/") -> path.toAbsoluteUrl(domain)
-			path.startsWith("/titles/") -> "/uploads$path".toAbsoluteUrl(domain)
-			else -> path.toAbsoluteUrl(domain)
-		}.toRelativeUrl(domain)
+		return (path.toUploadsChapterPath()
+			?.let {
+				"https://$domain$it".toHttpUrl().newBuilder()
+					.addQueryParameter("w", "3840")
+					.addQueryParameter("q", "85")
+					.build()
+					.toString()
+			}
+			?: path.toAbsoluteUrl(domain)).toRelativeUrl(domain)
+	}
+
+	private fun String.toUploadsChapterPath(): String? {
+		val pagePath = if (startsWith("http://", ignoreCase = true) || startsWith("https://", ignoreCase = true)) {
+			toHttpUrl().encodedPath
+		} else {
+			substringBefore('?')
+		}
+		val segments = pagePath.trim('/').split('/')
+		val chaptersIndex = segments.indexOf("chapters")
+		if (chaptersIndex < 0 || chaptersIndex + 2 >= segments.size) {
+			return null
+		}
+		val chapterId = segments[chaptersIndex + 1]
+		val pageName = segments.last().substringBeforeLast('.', segments.last()) + ".webp"
+		return "/uploads/chapters/$chapterId/$pageName"
 	}
 
 	private fun HttpUrl.isImageUrl(): Boolean {
 		return when {
 			host == domain && encodedPath == "/_next/image" -> true
 			host == domain && encodedPath.startsWith("/uploads/titles/") -> true
+			host == domain && encodedPath.startsWith("/uploads/chapters/") -> true
 			host == "s3.regru.cloud" && encodedPath.startsWith("/tomilolib/titles/") -> true
 			else -> false
 		}

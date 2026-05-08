@@ -29,6 +29,7 @@ import org.koitharu.kotatsu.parsers.util.parseHtml
 import org.koitharu.kotatsu.parsers.util.parseJson
 import org.koitharu.kotatsu.parsers.util.parseSafe
 import org.koitharu.kotatsu.parsers.util.toAbsoluteUrl
+import org.koitharu.kotatsu.parsers.util.suspendlazy.suspendLazy
 import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Date
@@ -57,6 +58,8 @@ internal class ProjectSuki(context: MangaLoaderContext) :
 			isSearchWithFiltersSupported = true,
 			isMultipleTagsSupported = false,
 		)
+
+	private val bookTitles = suspendLazy(initializer = ::fetchBookTitles)
 
 	override fun getRequestHeaders(): Headers = super.getRequestHeaders().newBuilder()
 		.set("Referer", "https://$domain/")
@@ -106,26 +109,50 @@ internal class ProjectSuki(context: MangaLoaderContext) :
 		return parseBookList(webClient.httpGet(url.build(), getRequestHeaders()).parseHtml())
 	}
 
-	private fun parseBookList(document: Document): List<Manga> {
+	private suspend fun parseBookList(document: Document): List<Manga> {
 		val result = LinkedHashMap<String, Manga>()
+		val titles = bookTitles.get()
 		document.select("a[href]").forEach { anchor ->
 			val bookId = anchor.absUrl("href").toBookId() ?: return@forEach
 			val container = anchor.parents().firstOrNull { parent ->
 				parent.select("a[href]").any { it.absUrl("href").toBookId() == bookId } &&
 					parent.select("img").isNotEmpty()
 			} ?: anchor
-			result.putIfAbsent(bookId, parseBookSummary(bookId, container, anchor))
+			result.putIfAbsent(bookId, parseBookSummary(bookId, container, anchor, titles[bookId]))
 		}
 		return result.values.toList()
 	}
 
-	private fun parseBookSummary(bookId: String, container: Element, anchor: Element): Manga {
+	private suspend fun fetchBookTitles(): Map<String, String> {
+		return runCatching {
+			val headers = getRequestHeaders().newBuilder()
+				.set("X-Requested-With", "XMLHttpRequest")
+				.set("Content-Type", "application/json;charset=UTF-8")
+				.set("Referer", "https://$domain/browse")
+				.build()
+			val data = webClient.httpPost(
+				"https://$domain/api/book/search".toHttpUrl(),
+				JSONObject().put("hash", JSONObject.NULL),
+				headers,
+			).parseJson().optJSONObject("data") ?: return@runCatching emptyMap()
+			buildMap {
+				for (key in data.keys()) {
+					val title = data.optJSONObject(key)?.optString("value")?.nullIfEmpty() ?: continue
+					put(key, title)
+				}
+			}
+		}.getOrDefault(emptyMap())
+	}
+
+	private fun parseBookSummary(bookId: String, container: Element, anchor: Element, apiTitle: String?): Manga {
 		val title = sequenceOf(
+			container.select("h1, h2, h3, h4, .title, [itemprop=name]").firstOrNull()?.text(),
 			container.select("a[href]")
 				.firstOrNull { it.absUrl("href").toBookId() == bookId && it.select("img").isEmpty() }
-				?.text(),
+				?.ownText(),
+			apiTitle,
+			anchor.ownText(),
 			anchor.text(),
-			container.select("h1, h2, h3, h4, .title, [itemprop=name]").firstOrNull()?.text(),
 			container.selectFirst("img[title]")?.attr("title"),
 			container.selectFirst("img[alt]")?.attr("alt"),
 			container.text(),

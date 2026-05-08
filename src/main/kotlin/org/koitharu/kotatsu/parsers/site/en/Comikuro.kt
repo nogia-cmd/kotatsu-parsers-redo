@@ -68,6 +68,7 @@ internal class Comikuro(context: MangaLoaderContext) : PagedMangaParser(context,
 	override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
 		super.onCreateConfig(keys)
 		keys.add(userAgentKey)
+		keys.add(ConfigKey.InterceptCloudflare(defaultValue = true))
 	}
 
 	override suspend fun getFilterOptions(): MangaListFilterOptions = MangaListFilterOptions(
@@ -264,23 +265,41 @@ internal class Comikuro(context: MangaLoaderContext) : PagedMangaParser(context,
 				};
 				const challengeDetected = () => {
 					const root = document.documentElement;
-					const lower = ((root && root.innerText) || '').toLowerCase();
+					const lower = (((root && root.innerText) || '') + '\n' + ((root && root.outerHTML) || '')).toLowerCase();
 					return document.querySelector('script[src*="challenge-platform"]') !== null ||
+						document.querySelector('script[src*="turnstile"]') !== null ||
+						document.querySelector('iframe[src*="challenges.cloudflare.com"]') !== null ||
+						document.querySelector('[src*="challenges.cloudflare.com"]') !== null ||
+						document.querySelector('.cf-turnstile') !== null ||
+						document.querySelector('input[name="cf-turnstile-response"]') !== null ||
 						document.getElementById('challenge-error-title') !== null ||
 						document.getElementById('challenge-error-text') !== null ||
 						document.querySelector('form[action*="__cf_chl"]') !== null ||
 						document.querySelector('.cf-browser-verification') !== null ||
 						((lower.includes('just a moment') || lower.includes('checking your browser')) && lower.includes('cloudflare')) ||
+						lower.includes('private access token challenge') ||
+						lower.includes('challenge-platform') ||
+						lower.includes('challenges.cloudflare.com') ||
+						lower.includes('cf-turnstile') ||
+						lower.includes('turnstile') ||
 						lower.includes('cf-chl-opt');
 				};
 				const ready = () => document.querySelector('$readySelector') !== null;
 				const startedAt = Date.now();
+				let readySince = 0;
 				const tick = () => {
 					if (challengeDetected()) {
 						finish();
 						return;
 					}
-					if (ready() || Date.now() - startedAt > 12000) {
+					if (ready()) {
+						if (!readySince) readySince = Date.now();
+						if (Date.now() - readySince > 9000) {
+							finish();
+							return;
+						}
+					}
+					if (Date.now() - startedAt > 18000) {
 						finish();
 						return;
 					}
@@ -323,6 +342,11 @@ internal class Comikuro(context: MangaLoaderContext) : PagedMangaParser(context,
 			lower.contains("cf-chl-opt") ||
 			lower.contains("window._cf_chl_opt") ||
 			lower.contains("/cdn-cgi/challenge-platform/") ||
+			lower.contains("challenge-platform") ||
+			lower.contains("challenges.cloudflare.com") ||
+			lower.contains("cf-turnstile") ||
+			lower.contains("turnstile") ||
+			lower.contains("private access token challenge") ||
 			lower.contains("form action=\"/cdn-cgi/l/chk_captcha") ||
 			lower.contains("challenge-error-title") ||
 			lower.contains("challenge-error-text")
