@@ -416,6 +416,7 @@ internal class Comix(context: MangaLoaderContext) :
                 const findGlue = () => {
                     let signer = null;
                     let installer = null;
+                    let responseHandler = null;
                     const keys = Object.keys(window);
                     for (let i = 0; i < keys.length; i++) {
                         const topName = keys[i];
@@ -437,18 +438,22 @@ internal class Comix(context: MangaLoaderContext) :
                             if (!installer) {
                                 try {
                                     let got = false;
+                                    let resFn = null;
                                     const fakeAxios = {
                                         interceptors: {
                                             request: { use: function() {} },
-                                            response: { use: function() { got = true; } }
+                                            response: { use: function(fn) { got = true; resFn = fn; } }
                                         },
                                         defaults: { headers: { common: {} }, transformRequest: [], transformResponse: [] }
                                     };
                                     fn(fakeAxios);
-                                    if (got) installer = fn;
+                                    if (got) {
+                                        installer = fn;
+                                        responseHandler = resFn;
+                                    }
                                 } catch (e) {}
                             }
-                            if (signer && installer) return { signer, installer };
+                            if (signer && installer) return { signer, installer, responseHandler };
                         }
                     }
                     return null;
@@ -459,15 +464,17 @@ internal class Comix(context: MangaLoaderContext) :
                     const glue = findGlue();
                     if (!glue) throw new Error("signer/decryptor not detected");
 
-                    const captured = { res: null };
-                    const fakeAxios = {
-                        interceptors: {
-                            request: { use: function() {} },
-                            response: { use: function(fn) { captured.res = fn; } }
-                        },
-                        defaults: { headers: { common: {} }, transformRequest: [], transformResponse: [] }
-                    };
-                    glue.installer(fakeAxios);
+                    const captured = { res: glue.responseHandler || null };
+                    if (!captured.res) {
+                        const fakeAxios = {
+                            interceptors: {
+                                request: { use: function() {} },
+                                response: { use: function(fn) { captured.res = fn; } }
+                            },
+                            defaults: { headers: { common: {} }, transformRequest: [], transformResponse: [] }
+                        };
+                        glue.installer(fakeAxios);
+                    }
 
                     const fetchProtected = (apiPath) => {
                         const signablePath = apiPath.split("?")[0].replace(/^\/api\/v1/, "");
@@ -500,6 +507,9 @@ internal class Comix(context: MangaLoaderContext) :
                                 throw new Error("decryptor returned promise; async evaluateJs is unsupported");
                             }
                             return { result: decoded && decoded.data };
+                        }
+                        if (raw && typeof raw === "object" && "e" in raw) {
+                            throw new Error("encrypted response received but decryptor was not captured");
                         }
                         if (raw && typeof raw === "object" && "result" in raw) return raw;
                         return { result: raw };
