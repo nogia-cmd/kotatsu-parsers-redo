@@ -33,7 +33,7 @@ import java.text.SimpleDateFormat
 import java.util.EnumSet
 import java.util.Locale
 
-@MangaSourceParser("MANGAK", "MangaK", "en", ContentType.MANGA)
+@MangaSourceParser("MANGAKIO", "MangaKIO", "en", ContentType.MANGA)
 internal class MangaK(context: MangaLoaderContext) :
 	PagedMangaParser(context, MangaParserSource.MANGAK, pageSize = 24) {
 
