@@ -35,7 +35,7 @@ import java.util.Locale
 
 @MangaSourceParser("MANGAKIO", "MangaKIO", "en", ContentType.MANGA)
 internal class MangaK(context: MangaLoaderContext) :
-	PagedMangaParser(context, MangaParserSource.MANGAK, pageSize = 24) {
+	PagedMangaParser(context, MangaParserSource.MANGAKIO, pageSize = 24) {
 
 	override val configKeyDomain = ConfigKey.Domain("mangak.io")
 
