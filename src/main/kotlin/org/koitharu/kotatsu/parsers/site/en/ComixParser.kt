@@ -166,12 +166,9 @@ internal class Comix(context: MangaLoaderContext) :
             addParam("page=$page")
         }
 
-        logDebug("getListPage http url=$url")
         val response = webClient.httpGet(url).parseJson()
-        logDebug("getListPage response keys=${response.keys().asSequence().joinToString(",")}")
         val result = response.getJSONObject("result")
         val items = result.getJSONArray("items")
-        logDebug("getListPage items count=${items.length()}")
 
         return (0 until items.length()).map { i ->
             val item = items.getJSONObject(i)
@@ -223,9 +220,7 @@ internal class Comix(context: MangaLoaderContext) :
 
         // Get detailed manga info
         val detailUrl = apiUrl("manga/$hashId")
-        logDebug("getDetails http url=$detailUrl")
         val response = webClient.httpGet(detailUrl).parseJson()
-        logDebug("getDetails response keys=${response.keys().asSequence().joinToString(",")}")
 
         if (response.has("result")) {
             val result = response.getJSONObject("result")
@@ -245,15 +240,12 @@ internal class Comix(context: MangaLoaderContext) :
 
     override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
         val chapterId = chapter.url.substringAfterLast("/").substringBefore("-")
-        logDebug("getPages start chapterUrl=${chapter.url} chapterId=$chapterId")
         val response = webViewApiJson("/api/v1/chapters/$chapterId")
-        logDebug("getPages response keys=${response.keys().asSequence().joinToString(",")}")
         val pagesRoot = response.optJSONObject("result")?.optJSONObject("pages")
         val baseUrl = pagesRoot?.optString("baseUrl").orEmpty().trimEnd('/')
         val pages = pagesRoot?.optJSONArray("items")
             ?: response.optJSONObject("result")?.optJSONArray("pages")
             ?: JSONArray()
-        logDebug("getPages pages count=${pages.length()} baseUrl=$baseUrl")
 
         return (0 until pages.length()).map { i ->
             val rawUrl = when (val item = pages.get(i)) {
@@ -276,10 +268,8 @@ internal class Comix(context: MangaLoaderContext) :
 
     private suspend fun getChapters(manga: Manga): List<MangaChapter> {
         val hashId = manga.url.substringAfter("/title/")
-        logDebug("getChapters start mangaUrl=${manga.url} hashId=$hashId")
         val allChapters = webViewChapterList(hashId)
         val allChapterObjects = (0 until allChapters.length()).map { allChapters.getJSONObject(it) }
-        logDebug("getChapters compact objects count=${allChapterObjects.size}")
         val chaptersBuilder = ChaptersListBuilder(allChapterObjects.size)
         for (chapterData in allChapterObjects) {
             val chapterId = chapterData.getLong("id")
@@ -314,7 +304,6 @@ internal class Comix(context: MangaLoaderContext) :
     private fun apiUrl(path: String): String = "https://$domain/api/v1/${path.removePrefix("/")}"
 
     private suspend fun webViewApiJson(apiPath: String): JSONObject {
-        logDebug("webViewApiJson start path=$apiPath")
         return evaluateWebViewJson(
             label = apiPath,
             script = buildWebViewApiScript("return JSON.stringify(await fetchProtected(${apiPath.toJsString()}));"),
@@ -323,7 +312,6 @@ internal class Comix(context: MangaLoaderContext) :
 
     private suspend fun webViewChapterList(hashId: String): JSONArray {
         val pathPrefix = "/api/v1/manga/$hashId/chapters?page="
-        logDebug("webViewChapterList start hashId=$hashId prefix=$pathPrefix")
         val json = evaluateWebViewJson(
             label = "chapters:$hashId",
             script = buildWebViewApiScript(
@@ -373,20 +361,17 @@ internal class Comix(context: MangaLoaderContext) :
 
                     const firstRoot = await fetchProtected(pagePath(1, ""));
                     const firstResult = firstRoot && firstRoot.result ? firstRoot.result : firstRoot;
-                    debug("chapter first page keys=" + (firstResult && typeof firstResult === "object" ? Object.keys(firstResult).join(",") : typeof firstResult));
                     if (!firstResult || !Array.isArray(firstResult.items)) {
                         const keys = firstResult && typeof firstResult === "object" ? Object.keys(firstResult).join(",") : typeof firstResult;
                         throw new Error("chapter payload has no items; keys=" + keys);
                     }
                     const firstItems = firstResult.items;
-                    debug("chapter first page count=" + firstItems.length);
                     if (!firstItems.length) {
                         return JSON.stringify({ items: [], debug: { pages: 1, count: 0, groupId: "", firstPageCount: 0 } });
                     }
 
                     const groupId = mostActiveGroupId(firstItems);
                     const firstPagination = pageInfo(firstResult, 1);
-                    debug("chapter selected groupId=" + groupId + " firstPage=" + firstPagination.current + "/" + firstPagination.last);
                     let page = 1;
                     if (!groupId) {
                         appendItems(firstItems);
@@ -402,7 +387,6 @@ internal class Comix(context: MangaLoaderContext) :
                         const items = result.items;
                         appendItems(items);
                         const pagination = pageInfo(result, page);
-                        debug("chapter page=" + page + " count=" + items.length + " pagination=" + pagination.current + "/" + pagination.last + " total=" + all.length);
                         if (!items.length || pagination.current >= pagination.last) break;
                         page++;
                     }
@@ -411,7 +395,6 @@ internal class Comix(context: MangaLoaderContext) :
             ),
         )
         val items = json.optJSONArray("items") ?: JSONArray()
-        logDebug("webViewChapterList done hashId=$hashId count=${items.length()} debug=${json.optJSONObject("debug")}")
         return items
     }
 
@@ -419,7 +402,6 @@ internal class Comix(context: MangaLoaderContext) :
         val bridgeScript = buildBridgeScript(script)
         val startedAt = System.currentTimeMillis()
         val bridgeUrl = "https://$domain/?kotatsu_comix_bridge=$startedAt"
-        logDebug("evaluateWebViewJson intercept url=$bridgeUrl label=$label scriptLen=${bridgeScript.length} timeoutMs=$WEBVIEW_API_TIMEOUT")
         val requests = runCatching {
             context.interceptWebViewRequests(
                 bridgeUrl,
@@ -431,13 +413,10 @@ internal class Comix(context: MangaLoaderContext) :
                 ),
             )
         }.getOrElse { e ->
-            logDebug("evaluateWebViewJson intercept failed label=$label elapsedMs=${System.currentTimeMillis() - startedAt} error=${e::class.java.simpleName}: ${e.message}")
             throw ParseException("Comix WebView API interception failed", bridgeUrl, e)
         }
-        logDebug("evaluateWebViewJson intercept done label=$label elapsedMs=${System.currentTimeMillis() - startedAt} requests=${requests.size}")
         val resultUrl = requests.firstOrNull()?.url
             ?: throw ParseException("Comix WebView API did not return a bridge result", bridgeUrl)
-        logDebug("evaluateWebViewJson bridge label=$label url=${resultUrl.take(LOG_EXCERPT)}")
         val decoded = when {
             resultUrl.contains("/error", ignoreCase = true) -> {
                 val message = resultUrl.queryParameterValue("msg") ?: "unknown WebView error"
@@ -446,27 +425,16 @@ internal class Comix(context: MangaLoaderContext) :
             else -> resultUrl.queryParameterValue("data")
                 ?: throw ParseException("Comix WebView API bridge result missing data", bridgeUrl)
         }
-        logDebug("evaluateWebViewJson decoded label=$label len=${decoded.length} excerpt=${decoded.take(LOG_EXCERPT)}")
         if (decoded == CLOUDFLARE_BLOCKED || isCloudflarePage(decoded)) {
-            logDebug("evaluateWebViewJson cloudflare label=$label")
             requestCloudflareVerification(bridgeUrl)
         }
         if (decoded.isBlank()) {
-            logDebug("evaluateWebViewJson blank label=$label")
             throw ParseException("Comix WebView API returned an empty response", bridgeUrl)
         }
         val json = runCatching { JSONObject(decoded) }.getOrElse { e ->
-            logDebug("evaluateWebViewJson invalid json label=$label")
             throw ParseException("Comix WebView API returned invalid JSON: ${decoded.take(200)}", bridgeUrl, e)
         }
-        logDebug("evaluateWebViewJson json label=$label keys=${json.keys().asSequence().joinToString(",")}")
-        json.optJSONArray("debugLog")?.let { debugLog ->
-            for (i in 0 until debugLog.length()) {
-                logDebug("evaluateWebViewJson js label=$label ${debugLog.optString(i)}")
-            }
-        }
         json.optString("error").nullIfEmpty()?.let { error ->
-            logDebug("evaluateWebViewJson error label=$label error=$error")
             throw ParseException("Comix WebView API failed: $error", bridgeUrl)
         }
         return json
@@ -498,108 +466,6 @@ internal class Comix(context: MangaLoaderContext) :
             (async () => {
                 const probePath = "/manga/g2rk/chapters";
                 const tokenRegex = /^[A-Za-z0-9_-]{20,200}$/;
-                const debugLog = [];
-                const debug = (message) => {
-                    const line = "[COMIX_BRIDGE] " + message;
-                    debugLog.push(message);
-                    try { console.log(line); } catch (e) {}
-                };
-                const debugChunked = (prefix, text, limit) => {
-                    const value = String(text || "");
-                    const max = Math.min(value.length, limit || 2000);
-                    debug(prefix + " len=" + value.length + " excerpt=" + value.slice(0, max));
-                };
-                const logDocumentState = (stage) => {
-                    const root = document.documentElement;
-                    const html = (root && root.outerHTML) || "";
-                    const scripts = Array.from(document.scripts || [])
-                        .map((script) => script.src || "[inline:" + ((script.textContent || "").length) + "]")
-                        .slice(0, 20)
-                        .join(" | ");
-                    debug("document stage=" + stage + " readyState=" + document.readyState + " url=" + location.href + " title=" + document.title + " htmlLen=" + html.length);
-                    debug("document scripts stage=" + stage + " count=" + (document.scripts ? document.scripts.length : 0) + " first=" + scripts);
-                    debugChunked("document html stage=" + stage, html, 2500);
-                    try {
-                        const resources = performance.getEntriesByType("resource")
-                            .map((entry) => entry.initiatorType + " " + entry.name + " transfer=" + entry.transferSize + " duration=" + Math.round(entry.duration))
-                            .slice(-30)
-                            .join(" || ");
-                        debug("performance resources stage=" + stage + " " + resources);
-                    } catch (e) {
-                        debug("performance resources failed stage=" + stage + " error=" + String((e && e.message) || e));
-                    }
-                };
-                const installNetworkLogging = () => {
-                    if (window.__kotatsuComixNetworkLogInstalled) return;
-                    window.__kotatsuComixNetworkLogInstalled = true;
-                    const requestUrlOf = (input) => {
-                        if (typeof input === "string") return input;
-                        if (input && typeof input.url === "string") return input.url;
-                        if (input && typeof input.href === "string") return input.href;
-                        try { return JSON.stringify(input); } catch (e) { return String(input); }
-                    };
-                    const requestMethodOf = (input, init) => {
-                        return (init && init.method) || (input && input.method) || "GET";
-                    };
-                    const originalFetch = window.fetch;
-                    if (typeof originalFetch === "function") {
-                        window.fetch = async function(input, init) {
-                            const url = requestUrlOf(input);
-                            const method = requestMethodOf(input, init);
-                            debug("fetch request method=" + method + " url=" + url);
-                            try {
-                                const response = await originalFetch.apply(this, arguments);
-                                const clone = response.clone();
-                                clone.text().then((text) => {
-                                    debug("fetch response status=" + response.status + " ok=" + response.ok + " url=" + response.url + " bytes=" + text.length + " contentType=" + (response.headers.get("content-type") || ""));
-                                    debugChunked("fetch body url=" + response.url, text, 2500);
-                                }).catch((e) => {
-                                    debug("fetch body read failed url=" + response.url + " error=" + String((e && e.message) || e));
-                                });
-                                return response;
-                            } catch (e) {
-                                debug("fetch failed url=" + url + " error=" + String((e && e.stack) || (e && e.message) || e));
-                                throw e;
-                            }
-                        };
-                    } else {
-                        debug("fetch logger skipped: window.fetch missing");
-                    }
-                    const OriginalXHR = window.XMLHttpRequest;
-                    if (typeof OriginalXHR === "function") {
-                        window.XMLHttpRequest = function() {
-                            const xhr = new OriginalXHR();
-                            let method = "";
-                            let url = "";
-                            const originalOpen = xhr.open;
-                            xhr.open = function(m, u) {
-                                method = m;
-                                url = String(u);
-                                debug("xhr request method=" + method + " url=" + url);
-                                return originalOpen.apply(xhr, arguments);
-                            };
-                            xhr.addEventListener("loadend", function() {
-                                let text = "";
-                                try {
-                                    if (!xhr.responseType || xhr.responseType === "text" || xhr.responseType === "json") {
-                                        text = String(xhr.responseText || "");
-                                    } else {
-                                        text = "[responseType=" + xhr.responseType + "]";
-                                    }
-                                } catch (e) {
-                                    text = "[response unavailable: " + String((e && e.message) || e) + "]";
-                                }
-                                debug("xhr response status=" + xhr.status + " url=" + url + " bytes=" + text.length + " contentType=" + (xhr.getResponseHeader("content-type") || ""));
-                                debugChunked("xhr body url=" + url, text, 2500);
-                            });
-                            return xhr;
-                        };
-                        window.XMLHttpRequest.prototype = OriginalXHR.prototype;
-                    } else {
-                        debug("xhr logger skipped: XMLHttpRequest missing");
-                    }
-                    debug("network logging installed");
-                };
                 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
                 const challengeDetected = () => {
                     const root = document.documentElement;
@@ -630,7 +496,6 @@ internal class Comix(context: MangaLoaderContext) :
                         const ns = window[topName];
                         if (!ns || typeof ns !== "object") continue;
                         const fnames = Object.keys(ns);
-                        debug("scan namespace=" + topName + " functions=" + fnames.length);
                         for (let j = 0; j < fnames.length; j++) {
                             const fn = ns[fnames[j]];
                             if (typeof fn !== "function") continue;
@@ -639,7 +504,6 @@ internal class Comix(context: MangaLoaderContext) :
                                     const out = fn(probePath);
                                     if (typeof out === "string" && out !== probePath && tokenRegex.test(out)) {
                                         signer = fn;
-                                        debug("signer found namespace=" + topName + " fn=" + fnames[j] + " tokenLen=" + out.length);
                                     }
                                 } catch (e) {}
                             }
@@ -658,7 +522,6 @@ internal class Comix(context: MangaLoaderContext) :
                                     if (got) {
                                         installer = fn;
                                         responseHandler = resFn;
-                                        debug("axios installer found namespace=" + topName + " fn=" + fnames[j] + " hasResponseHandler=" + !!resFn);
                                     }
                                 } catch (e) {}
                             }
@@ -669,31 +532,19 @@ internal class Comix(context: MangaLoaderContext) :
                 };
 
                 try {
-                    installNetworkLogging();
-                    debug("boot href=" + location.href + " title=" + document.title);
-                    logDocumentState("boot");
-                    window.addEventListener("load", () => logDocumentState("window-load"), { once: true });
-                    window.addEventListener("pageshow", () => logDocumentState("pageshow"), { once: true });
                     let glue = null;
                     for (let attempt = 0; attempt < 80; attempt++) {
                         if (challengeDetected()) {
-                            debug("cloudflare challenge detected at attempt=" + attempt);
                             return "$CLOUDFLARE_BLOCKED";
                         }
                         glue = findGlue();
                         if (glue) break;
-                        if (attempt === 0 || attempt % 10 === 9) {
-                            debug("glue not found attempt=" + (attempt + 1) + " windowKeys=" + Object.keys(window).length);
-                            logDocumentState("attempt-" + (attempt + 1));
-                        }
                         await sleep(250);
                     }
                     if (!glue) throw new Error("signer/decryptor not detected");
-                    debug("glue ready hasSigner=" + !!glue.signer + " hasInstaller=" + !!glue.installer + " hasResponseHandler=" + !!glue.responseHandler);
 
                     const captured = { res: glue.responseHandler || null };
                     if (!captured.res) {
-                        debug("response handler missing; reinstalling axios interceptor");
                         const fakeAxios = {
                             interceptors: {
                                 request: { use: function() {} },
@@ -702,7 +553,6 @@ internal class Comix(context: MangaLoaderContext) :
                             defaults: { headers: { common: {} }, transformRequest: [], transformResponse: [] }
                         };
                         glue.installer(fakeAxios);
-                        debug("response handler after reinstall=" + !!captured.res);
                     }
 
                     const signCandidates = (apiPath) => {
@@ -721,22 +571,18 @@ internal class Comix(context: MangaLoaderContext) :
                         let signedUrl = "";
                         let lastError = "";
                         const candidates = signCandidates(apiPath);
-                        debug("fetchProtected path=" + apiPath + " candidates=" + candidates.join("|"));
                         for (const signablePath of candidates) {
                             const sig = glue.signer(signablePath);
                             if (!sig) {
                                 lastError = "signer returned empty token";
-                                debug("signer returned empty token for=" + signablePath);
                                 continue;
                             }
                             signedUrl = apiPath + sep + "_=" + encodeURIComponent(sig);
-                            debug("fetch start path=" + apiPath + " signedPath=" + signablePath + " sigLen=" + sig.length);
                             resp = await fetch(signedUrl, {
                                 credentials: "include",
                                 headers: { "Accept": "application/json", "X-Requested-With": "XMLHttpRequest" }
                             });
                             text = await resp.text();
-                            debug("fetch done status=" + resp.status + " bytes=" + text.length + " signedPath=" + signablePath + " excerpt=" + text.slice(0, 120));
                             if (resp.status >= 200 && resp.status < 300) break;
                             lastError = "HTTP " + resp.status + " signed=" + signablePath + ": " + text.slice(0, 200);
                             if (resp.status !== 422) break;
@@ -746,9 +592,7 @@ internal class Comix(context: MangaLoaderContext) :
                             throw new Error(lastError || ("HTTP " + resp.status + ": " + text.slice(0, 200)));
                         }
                         const raw = JSON.parse(text);
-                        debug("raw json keys=" + (raw && typeof raw === "object" ? Object.keys(raw).join(",") : typeof raw));
                         if (raw && typeof raw === "object" && "e" in raw && captured.res) {
-                            debug("encrypted payload detected; invoking response decryptor");
                             const fakeResp = {
                                 data: raw,
                                 status: resp.status,
@@ -758,7 +602,6 @@ internal class Comix(context: MangaLoaderContext) :
                                 request: {}
                             };
                             const decoded = await captured.res(fakeResp);
-                            debug("decryptor returned keys=" + (decoded && decoded.data && typeof decoded.data === "object" ? Object.keys(decoded.data).join(",") : typeof decoded));
                             return { result: decoded && decoded.data };
                         }
                         if (raw && typeof raw === "object" && "e" in raw) {
@@ -770,8 +613,7 @@ internal class Comix(context: MangaLoaderContext) :
 
                     $body
                 } catch (e) {
-                    debug("error=" + String((e && e.stack) || (e && e.message) || e));
-                    return JSON.stringify({ error: String((e && e.message) || e), debugLog });
+                    return JSON.stringify({ error: String((e && e.message) || e) });
                 }
             })();
         """.trimIndent()
@@ -823,10 +665,6 @@ internal class Comix(context: MangaLoaderContext) :
             lower.contains("challenges.cloudflare.com") ||
             lower.contains("cf-turnstile") ||
             lower.contains("turnstile")
-    }
-
-    private fun logDebug(message: String) {
-        println("COMIX_DEBUG: $message")
     }
 
     private fun parseTerms(json: JSONObject): Set<MangaTag> {
@@ -897,7 +735,6 @@ internal class Comix(context: MangaLoaderContext) :
         private const val WEBVIEW_API_TIMEOUT = 90000L
         private const val CHAPTER_API_LIMIT = 100
         private const val MAX_CHAPTER_API_PAGES = 30
-        private const val LOG_EXCERPT = 500
         private const val CLOUDFLARE_BLOCKED = "CLOUDFLARE_BLOCKED"
         private const val INTERCEPT_RESULT_URL = "https://kotatsu.intercept/result"
         private const val INTERCEPT_ERROR_URL = "https://kotatsu.intercept/error"
