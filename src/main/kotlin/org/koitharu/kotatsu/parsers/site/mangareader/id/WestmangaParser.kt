@@ -20,7 +20,7 @@ import javax.crypto.spec.SecretKeySpec
 internal class WestmangaParser(context: MangaLoaderContext) :
 	PagedMangaParser(context, MangaParserSource.WESTMANGA, pageSize = 20) {
 
-	override val configKeyDomain = ConfigKey.Domain("westmanga.cc")
+	override val configKeyDomain = ConfigKey.Domain("v1.westmanga.cc")
 
 	private val apiDomain: String
     get() = "data.mantweh.online" 
