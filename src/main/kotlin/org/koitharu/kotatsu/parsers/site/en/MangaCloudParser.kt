@@ -1,18 +1,21 @@
 package org.koitharu.kotatsu.parsers.site.en
 
-import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Headers
+import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.Response
 import org.json.JSONArray
 import org.json.JSONObject
+import org.jsoup.HttpStatusException
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
 import org.koitharu.kotatsu.parsers.MangaSourceParser
 import org.koitharu.kotatsu.parsers.config.ConfigKey
 import org.koitharu.kotatsu.parsers.core.PagedMangaParser
+import org.koitharu.kotatsu.parsers.exception.ParseException
 import org.koitharu.kotatsu.parsers.model.*
 import org.koitharu.kotatsu.parsers.util.*
 import java.text.SimpleDateFormat
-import java.util.Locale
 import java.util.EnumSet
+import java.util.Locale
 import java.util.TimeZone
 
 @MangaSourceParser("MANGACLOUD", "MangaCloud", "en", ContentType.MANGA)
@@ -70,7 +73,7 @@ internal class MangaCloud(context: MangaLoaderContext) :
 	private suspend fun fetchAvailableTags(): Set<MangaTag> {
 		cachedTags?.let { return it }
 		return try {
-			val response = webClient.httpGet("$apiUrl/tag/list").parseJson()
+			val response = getApi("$apiUrl/tag/list").parseJson()
 			val data = response.getJSONArray("data")
 			val tags = mutableSetOf<MangaTag>()
 			for (i in 0 until data.length()) {
@@ -85,6 +88,8 @@ internal class MangaCloud(context: MangaLoaderContext) :
 			}
 			cachedTags = tags
 			tags
+		} catch (e: ParseException) {
+			throw e
 		} catch (_: Exception) {
 			emptySet()
 		}
@@ -102,7 +107,7 @@ internal class MangaCloud(context: MangaLoaderContext) :
 
 	private suspend fun getSearchManga(query: String): List<Manga> {
 		val jsonBody = JSONObject().apply { put("terms", query) }
-		val response = webClient.httpPost("$apiUrl/search".toHttpUrl(), jsonBody).parseJson()
+		val response = postApi("$apiUrl/search", jsonBody).parseJson()
 		val data = response.getJSONArray("data")
 		return (0 until data.length()).map { parseMangaFromSearch(data.getJSONObject(it)) }
 	}
@@ -143,7 +148,7 @@ internal class MangaCloud(context: MangaLoaderContext) :
 			if (page > 1) put("page", page)
 		}
 
-		val response = webClient.httpPost("$apiUrl/comic/library".toHttpUrl(), jsonBody).parseJson()
+		val response = postApi("$apiUrl/comic/library", jsonBody).parseJson()
 		val data = response.getJSONArray("data")
 		return (0 until data.length()).map { parseMangaFromLibrary(data.getJSONObject(it)) }
 	}
@@ -197,7 +202,7 @@ internal class MangaCloud(context: MangaLoaderContext) :
 	}
 
 	override suspend fun getDetails(manga: Manga): Manga {
-		val response = webClient.httpGet("$apiUrl/comic/${manga.url}").parseJson()
+		val response = getApi("$apiUrl/comic/${manga.url}").parseJson()
 		val data = response.getJSONObject("data")
 
 		val title = data.getString("title")
@@ -267,10 +272,13 @@ internal class MangaCloud(context: MangaLoaderContext) :
 		val chapterId = chapterData.getString("chapterId")
 		val comicId = chapterData.getString("comicId")
 
-		val response = webClient.httpGet("$apiUrl/chapter2/$chapterId").parseJson()
+		val response = getApi("$apiUrl/chapters/$chapterId").parseJson()
 		val data = response.getJSONObject("data")
 		val images = data.getJSONArray("images")
-		val actualComicId = data.optString("comicId", comicId)
+		val actualComicId = data.optString("comic_id")
+			.nullIfEmpty()
+			?: data.optString("comicId").nullIfEmpty()
+			?: comicId
 		val actualChapterId = data.optString("id", chapterId)
 
 		return (0 until images.length()).map { i ->
@@ -288,6 +296,53 @@ internal class MangaCloud(context: MangaLoaderContext) :
 		}
 	}
 
+	private suspend fun getApi(url: String): Response {
+		return runApiRequest(url) {
+			webClient.httpGet(url, getApiHeaders())
+		}
+	}
+
+	private suspend fun postApi(url: String, body: JSONObject): Response {
+		return runApiRequest(url) {
+			webClient.httpPost(url.toHttpUrl(), body, getApiHeaders())
+		}
+	}
+
+	private fun getApiHeaders(): Headers = getRequestHeaders().newBuilder()
+		.set("Origin", "https://$domain")
+		.build()
+
+	private suspend fun <T> runApiRequest(url: String, block: suspend () -> T): T {
+		try {
+			return block()
+		} catch (e: HttpStatusException) {
+			if (e.statusCode == HTTP_CONFLICT) {
+				requestMangaCloudGuard(url, e)
+			}
+			throw e
+		}
+	}
+
+	private suspend fun requestMangaCloudGuard(url: String, cause: Throwable? = null): Nothing {
+		val guardUrl = "https://$domain/"
+		runCatching {
+			context.evaluateJs(
+				guardUrl,
+				"window.localStorage.removeItem('sd'); 'ok';",
+				timeout = 5000L,
+			)
+		}
+		try {
+			context.requestBrowserAction(this, guardUrl)
+		} catch (e: UnsupportedOperationException) {
+			throw ParseException(
+				"MangaCloud verification required. Open MangaCloud in WebView and retry.",
+				url,
+				cause ?: e,
+			)
+		}
+		throw ParseException("Retry after MangaCloud verification.", url, cause)
+	}
 
 	private fun parseDate(dateStr: String): Long = try {
 		val sdf = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.ROOT)
@@ -319,3 +374,5 @@ internal class MangaCloud(context: MangaLoaderContext) :
 		return tags
 	}
 }
+
+private const val HTTP_CONFLICT = 409
