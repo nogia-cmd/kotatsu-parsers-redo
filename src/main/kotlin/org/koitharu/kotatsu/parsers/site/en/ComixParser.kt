@@ -101,9 +101,12 @@ internal class Comix(context: MangaLoaderContext) :
     }
 
     override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
-        val url = buildString {
-            append(apiUrl("manga"))
-            append("?")
+        // The `/api/v1/manga` listing/search endpoint is request-signed: an
+        // unsigned plain GET now returns 403 "missing token". Build a relative
+        // API path and let the WebView bridge (`fetchProtected`) sign it, the
+        // same way chapters and pages are fetched.
+        val apiPath = buildString {
+            append("/api/v1/manga?")
             var firstParam = true
             fun addParam(param: String) {
                 if (firstParam) {
@@ -152,7 +155,7 @@ internal class Comix(context: MangaLoaderContext) :
             addParam("page=$page")
         }
 
-        val response = getApiJson(url)
+        val response = webViewApiJson(apiPath)
         val result = response.getJSONObject("result")
         val items = result.getJSONArray("items")
 
@@ -204,18 +207,17 @@ internal class Comix(context: MangaLoaderContext) :
         val hashId = manga.url.substringAfter("/title/")
         val chaptersDeferred = async { getChapters(manga) }
 
-        val response = getApiJson(apiUrl("manga/$hashId"))
+        // Enrich from the single-title endpoint when possible. It's the same
+        // signed `/api/v1/manga/...` family as the listing, so an unsigned GET
+        // may 403; if it does, fall back to the listing-derived manga (which
+        // already carries synopsis/tags/authors) so details still open.
+        val updatedManga = runCatching { getApiJson(apiUrl("manga/$hashId")) }
+            .getOrNull()
+            ?.takeIf { it.has("result") }
+            ?.let { parseMangaFromJson(it.getJSONObject("result")) }
+            ?: manga
 
-        if (response.has("result")) {
-            val result = response.getJSONObject("result")
-            val updatedManga = parseMangaFromJson(result)
-
-            return@coroutineScope updatedManga.copy(
-                chapters = chaptersDeferred.await(),
-            )
-        }
-
-        return@coroutineScope manga.copy(
+        return@coroutineScope updatedManga.copy(
             chapters = chaptersDeferred.await(),
         )
     }
