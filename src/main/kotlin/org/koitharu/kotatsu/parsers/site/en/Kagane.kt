@@ -13,10 +13,8 @@ import org.koitharu.kotatsu.parsers.config.ConfigKey
 import org.koitharu.kotatsu.parsers.core.PagedMangaParser
 import org.koitharu.kotatsu.parsers.model.*
 import org.koitharu.kotatsu.parsers.util.*
-import org.koitharu.kotatsu.parsers.webview.InterceptionConfig
 import java.math.BigInteger
 import java.net.URI
-import java.net.URLDecoder
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.charset.StandardCharsets
@@ -146,6 +144,11 @@ internal class Kagane(context: MangaLoaderContext) :
         if (!filter.query.isNullOrEmpty()) {
             jsonBody.put("title", filter.query)
         }
+        jsonBody.put("source_type", JSONArray().apply {
+            put("Official")
+            put("Unofficial")
+            put("Mixed")
+        })
 
         val genreIds = filter.tags.map { it.key }.filter { UUID_REGEX.matches(it) }
         if (genreIds.isNotEmpty()) {
@@ -156,6 +159,28 @@ internal class Kagane(context: MangaLoaderContext) :
             genresObj.put("match_all", false)
             jsonBody.put("genres", genresObj)
         }
+        if (filter.tagsExclude.isNotEmpty()) {
+            val excludedGenreIds = filter.tagsExclude.map { it.key }.filter { UUID_REGEX.matches(it) }
+            if (excludedGenreIds.isNotEmpty()) {
+                val genresObj = jsonBody.optJSONObject("genres") ?: JSONObject().also {
+                    jsonBody.put("genres", it)
+                }
+                genresObj.put("exclude", JSONArray().apply {
+                    excludedGenreIds.forEach(::put)
+                })
+            }
+        }
+        jsonBody.put("content_rating", JSONArray().apply {
+            val ratings = filter.contentRating.ifEmpty {
+                EnumSet.of(ContentRating.SAFE, ContentRating.SUGGESTIVE, ContentRating.ADULT)
+            }
+            if (ContentRating.SAFE in ratings) put("safe")
+            if (ContentRating.SUGGESTIVE in ratings) put("suggestive")
+            if (ContentRating.ADULT in ratings) {
+                put("erotica")
+                put("pornographic")
+            }
+        })
 
         val headers = getRequestHeaders().newBuilder()
             .add("Origin", "https://$domain")
@@ -183,7 +208,7 @@ internal class Kagane(context: MangaLoaderContext) :
             val title = if (src.isNotEmpty()) "$name [$src]" else name
             val coverImageId = item.optString("cover_image_id").ifBlank { item.optString("coverImageId") }
             val coverUrl = if (coverImageId.isNotBlank()) {
-                "$apiUrl/api/v2/image/$coverImageId/compressed"
+                "$apiUrl/api/v2/image/$coverImageId"
             } else {
                 "$apiUrl/api/v2/series/$id/thumbnail"
             }
@@ -230,7 +255,7 @@ internal class Kagane(context: MangaLoaderContext) :
             "ONGOING" -> MangaState.ONGOING
             "COMPLETED", "ENDED" -> MangaState.FINISHED
             "HIATUS" -> MangaState.PAUSED
-            "CANCELLED", "CANCELED", "DROPPED" -> MangaState.ABANDONED
+            "ABANDONED", "CANCELLED", "CANCELED", "DROPPED" -> MangaState.ABANDONED
             else -> null
         }
 
@@ -278,14 +303,52 @@ internal class Kagane(context: MangaLoaderContext) :
                 for (i in 0 until arr.length()) {
                     val staff = arr.optJSONObject(i) ?: continue
                     val role = staff.optString("role")
-                    if (role.equals("author", ignoreCase = true) || role.equals("artist", ignoreCase = true)) {
+                    if (
+                        role.contains("author", ignoreCase = true) ||
+                        role.contains("story", ignoreCase = true) ||
+                        role.contains("artist", ignoreCase = true) ||
+                        role.contains("art", ignoreCase = true)
+                    ) {
                         staff.optString("name").takeIf { it.isNotBlank() }?.let(authors::add)
                     }
                 }
             }
         }
 
-        val dateFormat = SimpleDateFormat("yyyy-MM-dd", Locale.ENGLISH)
+        val altTitles = json.optJSONArray("series_alternate_titles")?.let { arr ->
+            buildSet {
+                for (i in 0 until arr.length()) {
+                    val item = arr.optJSONObject(i) ?: continue
+                    item.optString("title").takeIf { it.isNotBlank() }?.let(::add)
+                }
+            }
+        } ?: emptySet()
+
+        val description = buildString {
+            json.optString("description")
+                .ifBlank { json.optString("summary") }
+                .takeIf { it.isNotBlank() }
+                ?.let {
+                    append(it.trim())
+                }
+            if (altTitles.isNotEmpty()) {
+                if (isNotEmpty()) append("\n\n")
+                append("Associated Name(s):\n")
+                altTitles.forEach {
+                    append(it)
+                    append('\n')
+                }
+            }
+        }.trim().ifBlank { null }
+
+        val coverUrl = json.optJSONArray("series_covers")
+            ?.optJSONObject(0)
+            ?.optString("image_id")
+            ?.takeIf { it.isNotBlank() }
+            ?.let { "$apiUrl/api/v2/image/$it" }
+            ?: manga.coverUrl
+
+        val dateFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.ENGLISH)
         fun parseChapters(content: JSONArray): List<MangaChapter> {
             val chapters = ArrayList<MangaChapter>(content.length())
             for (i in 0 until content.length()) {
@@ -305,11 +368,10 @@ internal class Kagane(context: MangaLoaderContext) :
                     chapterNumber != null -> chapterNumber
                     else -> 0f
                 }
-                val chTitle = ch.optString("title")
-                    .ifBlank { ch.optString("name") }
-                    .ifBlank { chapterNo.takeIf { it.isNotBlank() }?.let { "Chapter $it" }.orEmpty() }
-                    .ifBlank { "Chapter $number" }
-                val pageCount = ch.optInt("page_count", ch.optInt("pages_count", ch.optInt("pagesCount", 0)))
+                val rawTitle = ch.optString("title").ifBlank { ch.optString("name") }.trim()
+                val chTitle = rawTitle.ifBlank {
+                    chapterNo.takeIf { it.isNotBlank() }?.let { "Ch.$it" }.orEmpty()
+                }.ifBlank { "Chapter $number" }
                 val volume = ch.optString("volume_no")
                     .ifBlank { ch.optString("volume") }
                     .toIntOrNull() ?: 0
@@ -317,17 +379,23 @@ internal class Kagane(context: MangaLoaderContext) :
                     .ifBlank { ch.optString("release_date") }
                     .ifBlank { ch.optString("releaseDate") }
                     .ifBlank { ch.optString("created_at") }
-                    .substringBefore('T')
+                val groups = ch.optJSONArray("groups")
                 chapters.add(
                     MangaChapter(
                         id = generateUid("$seriesId:$chId"),
                         title = chTitle,
                         number = number,
                         volume = volume,
-                        url = "/series/$seriesId/$chId?pages=$pageCount",
-                        uploadDate = try { dateFormat.parse(dateStr)?.time ?: 0L } catch (_: Exception) { 0L },
+                        url = "/series/$seriesId/reader/$chId",
+                        uploadDate = dateFormat.parseSafe(dateStr),
                         source = source,
-                        scanlator = null,
+                        scanlator = groups?.let { arr ->
+                            buildList {
+                                for (j in 0 until arr.length()) {
+                                    arr.optJSONObject(j)?.optString("title")?.takeIf { it.isNotBlank() }?.let(::add)
+                                }
+                            }.joinToString().ifBlank { null }
+                        },
                         branch = null,
                     ),
                 )
@@ -359,7 +427,10 @@ internal class Kagane(context: MangaLoaderContext) :
         }
 
         return manga.copy(
-            description = json.optString("description").ifBlank { json.optString("summary") }.ifBlank { null },
+            title = json.optString("title").ifBlank { manga.title },
+            altTitles = altTitles,
+            coverUrl = coverUrl,
+            description = description,
             state = state,
             authors = authors,
             tags = genres,
@@ -376,231 +447,35 @@ internal class Kagane(context: MangaLoaderContext) :
     override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
         val uri = URI(chapter.url)
         val pathParts = uri.path.split("/").filter { it.isNotEmpty() }
-        if (pathParts.size < 3) throw Exception("Invalid chapter URL format: ${chapter.url}")
+        if (pathParts.size < 4) throw Exception("Invalid chapter URL format: ${chapter.url}")
 
-        val seriesId = pathParts[1]
-        val chapterId = pathParts[2]
-        val query = uri.query ?: ""
-        val pageCount = query.split("&")
-            .find { it.startsWith("pages=") }
-            ?.substringAfter("=")
-            ?.toIntOrNull() ?: 0
-
-        dbg("getPages start seriesId=$seriesId chapterId=$chapterId pageCount=$pageCount url=${chapter.url}")
-
-        // 1. Fetch optional Widevine server certificate
-        val cert = getCertificate().orEmpty()
-        dbg("certificate base64Len=${cert.length} (empty=${cert.isEmpty()})")
-
-        // 2. Generate PSSH
-        val pssh = getPssh(chapterId)
-        dbg("pssh=$pssh")
-
-        // 3. Construct JS
-        val script = """
-            (async function() {
-                try {
-                    const certBase64 = "$cert";
-                    const psshBase64 = "$pssh";
-                    const config = [{
-                        initDataTypes: ["cenc"],
-                        audioCapabilities: [],
-                        videoCapabilities: [{ contentType: 'video/mp4; codecs="avc1.42E01E"' }]
-                    }];
-
-                    let access;
-                    try {
-                        access = await navigator.requestMediaKeySystemAccess("com.widevine.alpha", config);
-                    } catch (e) {
-                        access = await navigator.requestMediaKeySystemAccess("com.widevine.alpha", config);
-                    }
-
-                    const mediaKeys = await access.createMediaKeys();
-                    if (certBase64) {
-                        try {
-                            const binaryString = atob(certBase64);
-                            const bytes = new Uint8Array(binaryString.length);
-                            for (var i = 0; i < binaryString.length; i++) {
-                                bytes[i] = binaryString.charCodeAt(i);
-                            }
-                            if (bytes.length > 0) {
-                                await mediaKeys.setServerCertificate(bytes.buffer);
-                            }
-                        } catch (e) {}
-                    }
-
-                    const session = mediaKeys.createSession();
-
-                    const psshBinary = atob(psshBase64);
-                    const psshBytes = new Uint8Array(psshBinary.length);
-                    for (var i = 0; i < psshBinary.length; i++) {
-                        psshBytes[i] = psshBinary.charCodeAt(i);
-                    }
-
-                    const promise = new Promise((resolve, reject) => {
-                        let fallback = null;
-                        let settled = false;
-                        const settle = (msg) => {
-                            if (settled) return;
-                            settled = true;
-                            resolve(msg);
-                        };
-                        session.addEventListener("message", (event) => {
-                            // The CDM can first emit a service-certificate /
-                            // individualization request (Widevine SignedMessage
-                            // type 4) which is NOT a valid license challenge.
-                            // Always prefer the real license request (type 1).
-                            if (event.messageType === "license-request") {
-                                settle(event.message);
-                                return;
-                            }
-                            // Keep the first non-license message as a fallback and
-                            // wait briefly in case the license request follows, so
-                            // we never hang nor regress to no challenge at all.
-                            if (fallback === null) {
-                                fallback = event.message;
-                                setTimeout(() => settle(fallback), 2000);
-                            }
-                        });
-                        session.addEventListener("error", (err) => {
-                             reject(err);
-                        });
-                    });
-
-                    await session.generateRequest("cenc", psshBytes.buffer);
-                    const message = await promise;
-
-                    // Convert ArrayBuffer to Base64
-                    let binary = '';
-                    const bytesMsg = new Uint8Array(message);
-                    for (let i = 0; i < bytesMsg.byteLength; i++) {
-                        binary += String.fromCharCode(bytesMsg[i]);
-                    }
-                    const challenge = btoa(binary);
-
-                    // Return challenge
-                    window.location.href = "https://kotatsu.intercept/result?challenge=" + encodeURIComponent(challenge);
-
-                } catch (e) {
-                    window.location.href = "https://kotatsu.intercept/error?msg=" + encodeURIComponent(e.toString());
-                }
-            })();
-        """.trimIndent()
-
-        // 4. Intercept to get challenge
-        val config = InterceptionConfig(
-            timeoutMs = 15000,  // Reduced from 60s to 15s - DRM challenge usually comes in 5-10s
-            urlPattern = Regex("https://kotatsu\\.intercept/.*", RegexOption.IGNORE_CASE),
-            pageScript = script,
-            maxRequests = 1  // Stop immediately after capturing the challenge
-        )
-
-        val interceptUrl = "https://$domain/series/$seriesId/$chapterId"
-        val requests = context.interceptWebViewRequests(interceptUrl, config)
-        dbg("interception captured=${requests.size} resultUrl=${requests.firstOrNull()?.url}")
-
-        val resultRequest = requests.firstOrNull() ?: throw Exception("Failed to intercept DRM challenge")
-
-        if (resultRequest.url.contains("/error")) {
-            val errorMsg = resultRequest.getQueryParameter("msg") ?: "Unknown error"
-            dbg("DRM JS error: $errorMsg")
-            throw Exception("DRM JS Error: $errorMsg")
-        }
-
-        val challengeEncoded = resultRequest.getQueryParameter("challenge") ?: throw Exception("No challenge in interception")
-        val challenge = URLDecoder.decode(challengeEncoded, StandardCharsets.UTF_8.name())
-        runCatching {
-            val challengeBytes = Base64.getDecoder().decode(challenge)
-            dbg("challenge b64Len=${challenge.length} decodedLen=${challengeBytes.size} smType=${signedMessageType(challengeBytes)} head=${challengeBytes.headHex()}")
-        }.onFailure { dbg("challenge b64Len=${challenge.length} (not base64-decodable: ${it.message})") }
-
-        // 5. POST to API to get token
-        val challengeUrl = "$apiUrl/api/v2/books/$chapterId?is_datasaver=false"
-        val jsonBody = JSONObject()
-        jsonBody.put("challenge", challenge)
-
-        val integrityToken = getIntegrityToken()
-        dbg("integrityToken len=${integrityToken.length} POST $challengeUrl body=$jsonBody")
-        val headers = getRequestHeaders().newBuilder()
-            .add("Origin", "https://$domain")
-            .add("Referer", "https://$domain/")
-            .add("x-integrity-token", integrityToken)
-            .build()
-
-        val responseBody = webClient.httpPost(challengeUrl.toHttpUrl(), jsonBody, headers).parseRaw()
-        dbg("token response body (len=${responseBody.length}): $responseBody")
-
-        val tokenResponse = try {
-            JSONObject(responseBody)
-        } catch (e: Exception) {
-            throw Exception("Invalid JSON token response: $responseBody")
-        }
-
-        dbg("token response keys=${tokenResponse.keys().asSequence().toList()}")
-
-        val token = tokenResponse.optString("access_token").ifBlank {
-            tokenResponse.optString("accessToken")
+        val chapterId = pathParts.last()
+        val challenge = getChallengeResponse(chapterId)
+        accessToken = challenge.optString("access_token").ifBlank {
+            challenge.optString("accessToken")
         }.ifBlank {
-            throw Exception("Invalid token response: missing access token")
+            throw Exception("Invalid challenge response: missing access token")
         }
-        val currentCacheUrl = tokenResponse.optString("cache_url").ifBlank {
-            tokenResponse.optString("cacheUrl")
+        cacheUrl = challenge.optString("cache_url").ifBlank {
+            challenge.optString("cacheUrl")
         }.ifBlank {
-            throw Exception("Invalid token response: missing cache url")
+            throw Exception("Invalid challenge response: missing cache url")
         }
 
-        dbg("token=${token.take(24)}... cacheUrl=$currentCacheUrl")
-
-        val pagesJson = tokenResponse.optJSONArray("pages")
-        dbg("pages array present=${pagesJson != null} length=${pagesJson?.length() ?: 0} firstEntry=${pagesJson?.opt(0)}")
-        if (pagesJson != null && pagesJson.length() > 0) {
-            val pages = (0 until pagesJson.length()).mapNotNull { index ->
-                val pageEntry = pagesJson.opt(index)
-                val pageUuid = pageEntry.toPageFileId()
-                if (pageUuid.isBlank()) return@mapNotNull null
-                val pageIndex = when (pageEntry) {
-                    is JSONObject -> pageEntry.optInt(
-                        "pageNumber",
-                        pageEntry.optInt("page_number", pageEntry.optInt("index", index + 1)),
-                    )
-                    else -> index + 1
-                }
-                val imageUrl = "$currentCacheUrl/api/v2/books/file/$chapterId/$pageUuid?token=$token&is_datasaver=false&sid=$seriesId&index=$pageIndex"
-                MangaPage(
-                    id = generateUid(imageUrl),
-                    url = imageUrl,
-                    preview = null,
-                    source = source,
-                )
-            }
-            if (pages.isNotEmpty()) {
-                dbg("PATH=pages-array count=${pages.size} sample=${pages.take(3).map { it.url }}")
-                return pages
-            }
+        val pages = parseManifestPages(challenge)
+        if (pages.isEmpty()) {
+            throw Exception("Invalid challenge response: missing pages manifest")
         }
 
-        val mappingJson = tokenResponse.optJSONObject("page_mapping")
-            ?: tokenResponse.optJSONObject("pageMapping")
-            ?: tokenResponse.optJSONObject("file_mapping")
-            ?: tokenResponse.optJSONObject("fileMapping")
-            ?: tokenResponse.optJSONObject("files")
-        dbg("mappingJson present=${mappingJson != null} keys=${mappingJson?.keys()?.asSequence()?.toList()}")
-        val mapping = mutableMapOf<Int, String>()
-        mappingJson?.keys()?.forEach { key ->
-            val idx = key.toIntOrNull()
-            val fileId = mappingJson.opt(key).toPageFileId()
-            if (idx != null && fileId.isNotBlank()) mapping[idx] = fileId
-        }
-        val totalPages = if (pageCount > 0) pageCount else mapping.size
-        if (totalPages <= 0) {
-            throw Exception("Unable to parse pages from token response")
-        }
-        val result = (0 until totalPages).map { index ->
-            val pageIndex = index + 1
-            val fileId = mapping[pageIndex]
-                ?: mapping[index]
-                ?: "%04d.jpg".format(pageIndex)
-            val imageUrl = "$currentCacheUrl/api/v2/books/file/$chapterId/$fileId?token=$token&is_datasaver=false&sid=$seriesId&index=$pageIndex"
+        return pages.sortedBy { it.pageNumber }.map { page ->
+            val ext = page.ext?.takeIf { it.isNotBlank() } ?: "jxl"
+            val imageUrl = "$cacheUrl/api/v2/books/page".toHttpUrl().newBuilder()
+                .addPathSegment(chapterId)
+                .addPathSegment("${page.pageUuid}.$ext")
+                .addQueryParameter("token", accessToken)
+                .addQueryParameter("is_datasaver", "false")
+                .build()
+                .toString()
             MangaPage(
                 id = generateUid(imageUrl),
                 url = imageUrl,
@@ -608,10 +483,42 @@ internal class Kagane(context: MangaLoaderContext) :
                 source = source,
             )
         }
-        dbg("PATH=${if (mapping.isEmpty()) "FALLBACK-%04d.jpg" else "mapping"} totalPages=$totalPages mappingSize=${mapping.size} sample=${result.take(3).map { it.url }}")
-        return result
     }
 
+    private data class ManifestPage(
+        val pageNumber: Int,
+        val pageUuid: String,
+        val ext: String?,
+    )
+
+    private fun parseManifestPages(challenge: JSONObject): List<ManifestPage> {
+        val pagesJson = challenge.optJSONObject("manifest")?.optJSONArray("pages")
+            ?: challenge.optJSONArray("pages")
+            ?: JSONArray()
+        return buildList {
+            for (i in 0 until pagesJson.length()) {
+                val page = pagesJson.optJSONObject(i) ?: continue
+                val pageUuid = page.optString("page_id")
+                    .ifBlank { page.optString("pageId") }
+                    .ifBlank { page.optString("page_uuid") }
+                    .ifBlank { page.optString("pageUuid") }
+                if (pageUuid.isBlank()) continue
+                add(
+                    ManifestPage(
+                        pageNumber = page.optInt(
+                            "page_no",
+                            page.optInt("pageNo", page.optInt("page_number", i + 1)),
+                        ),
+                        pageUuid = pageUuid,
+                        ext = page.optString("ext").ifBlank { null },
+                    ),
+                )
+            }
+        }
+    }
+
+    private var cacheUrl = "https://akari.$domain"
+    private var accessToken: String = ""
     private var cachedCert: String? = null
     private var certificateFetchAttempted = false
     private var integrityToken: String = ""
@@ -677,6 +584,17 @@ internal class Kagane(context: MangaLoaderContext) :
         return integrityToken
     }
 
+    private suspend fun getChallengeResponse(chapterId: String): JSONObject {
+        val integrityToken = getIntegrityToken()
+        val headers = getRequestHeaders().newBuilder()
+            .add("Origin", "https://$domain")
+            .add("Referer", "https://$domain/")
+            .add("x-integrity-token", integrityToken)
+            .build()
+        val challengeUrl = "$apiUrl/api/v2/books/$chapterId?is_datasaver=false"
+        return webClient.httpPost(challengeUrl.toHttpUrl(), JSONObject(), headers).parseJson()
+    }
+
     private fun getPssh(chapterId: String): String {
         val hash = ":$chapterId".sha256().copyOfRange(0, 16)
 
@@ -738,56 +656,17 @@ internal class Kagane(context: MangaLoaderContext) :
         return result
     }
 
-    // Interceptor logic for image decryption
     override fun intercept(chain: Interceptor.Chain): Response {
-        val url = chain.request().url
-        if (url.queryParameterNames.contains("token") && url.encodedPath.contains("/file/")) {
-            val pathSegments = url.pathSegments
-            val booksIndex = pathSegments.indexOf("books")
-            if (booksIndex != -1) {
-                val chapterId = when {
-                    booksIndex + 2 < pathSegments.size && pathSegments[booksIndex + 1] == "file" ->
-                        pathSegments[booksIndex + 2]
-                    booksIndex + 3 < pathSegments.size && pathSegments[booksIndex + 2] == "file" ->
-                        pathSegments[booksIndex + 3]
-                    else -> null
-                } ?: return chain.proceed(chain.request())
-
-                val seriesId = url.queryParameter("sid").orEmpty()
-                val seriesKey = if (seriesId.isBlank()) chapterId else seriesId
-                val index = url.queryParameter("index")?.toIntOrNull() ?: return chain.proceed(chain.request())
-                val fileName = pathSegments.last()
-                val imageResp = chain.proceed(chain.request())
-                if (!imageResp.isSuccessful) {
-                    dbg("IMG http=${imageResp.code} file=$fileName index=$index chapterId=$chapterId")
-                    return imageResp
-                }
-
-                val contentType = imageResp.body?.contentType()
-                val imageBytes = imageResp.body?.bytes() ?: return imageResp
-                dbg("IMG ok file=$fileName index=$index len=${imageBytes.size} ct=$contentType head=${imageBytes.headHex()}")
-
-                try {
-                    val decrypted = decryptImage(imageBytes, seriesKey, chapterId)
-                    dbg("  decryptImage ${if (decrypted == null) "FAILED(null)" else "ok len=${decrypted.size} head=${decrypted.headHex()}"}")
-                    val processed = decrypted?.let {
-                        processData(it, index, seriesKey, chapterId)
-                    }
-                    dbg("  processData -> ${if (processed == null) "null(invalid)" else "ok len=${processed.size} head=${processed.headHex()}"}")
-                    val outputBytes = processed ?: imageBytes
-                    dbg("  IMG output file=$fileName usedDecrypted=${processed != null} outLen=${outputBytes.size}")
-                    return imageResp.newBuilder()
-                        .body(outputBytes.toResponseBody(contentType))
-                        .build()
-                } catch (e: Exception) {
-                    dbg("  IMG decrypt EXCEPTION file=$fileName ${e.message}")
-                    return imageResp.newBuilder()
-                        .body(imageBytes.toResponseBody(contentType))
-                        .build()
-                }
-            }
+        val request = chain.request()
+        val host = request.url.host
+        if (host == domain || host.endsWith(".$domain")) {
+            val newRequest = request.newBuilder()
+                .header("Origin", "https://$domain")
+                .header("Referer", "https://$domain/")
+                .build()
+            return chain.proceed(newRequest)
         }
-        return chain.proceed(chain.request())
+        return chain.proceed(request)
     }
 
     // Decryption helpers

@@ -2,6 +2,7 @@ package org.koitharu.kotatsu.parsers.site.madara.en.theblank
 
 import org.json.JSONObject
 import org.jsoup.nodes.Document
+import org.koitharu.kotatsu.parsers.Broken
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
 import org.koitharu.kotatsu.parsers.MangaSourceParser
 import org.koitharu.kotatsu.parsers.config.ConfigKey
@@ -19,7 +20,7 @@ import java.util.Base64
 import okio.Buffer
 import java.util.concurrent.ConcurrentHashMap
 
-
+@Broken
 @MangaSourceParser("THEBLANK", "TheBlank", "en", ContentType.HENTAI)
 internal class TheBlank(context: MangaLoaderContext) :
     PagedMangaParser(context, MangaParserSource.THEBLANK, 24) {
