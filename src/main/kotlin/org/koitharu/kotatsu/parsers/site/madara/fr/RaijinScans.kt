@@ -260,7 +260,7 @@ internal class RaijinScans(context: MangaLoaderContext) :
 
 		// Check if we're blocked by Cloudflare challenge
 		if (isCloudflareChallenge(doc)) {
-			// Use evaluateJs to load the page in a real browser and wait for images to load
+			// Use evaluateJs with MutationObserver + scroll to collect all images
 			try {
 				val jsPages = loadChapterPagesViaJs(chapterUrl)
 				if (jsPages.isNotEmpty()) {
@@ -269,7 +269,6 @@ internal class RaijinScans(context: MangaLoaderContext) :
 			} catch (e: Exception) {
 				// evaluateJs failed, try browser action below
 			}
-			// If JS evaluation also fails, request manual browser action
 			try {
 				context.requestBrowserAction(this, chapterUrl)
 			} catch (e: UnsupportedOperationException) {
@@ -277,18 +276,43 @@ internal class RaijinScans(context: MangaLoaderContext) :
 			}
 		}
 
-		// Try to find images that are already loaded (after JS execution)
-		val loadedImages = doc.select("figure.page img[src], div.reading-content img[src], div.protected-image-data img[src]")
-		if (loadedImages.isNotEmpty()) {
-			return loadedImages.mapNotNull { img ->
-				val imageUrl = img.attr("src").takeIf { it.isNotBlank() } ?: return@mapNotNull null
-				MangaPage(
-					id = generateUid(imageUrl),
-					url = imageUrl,
-					preview = null,
-					source = source,
-				)
+		// Try the AJAX config approach with pagination (returns ALL images)
+		decodeRjAjaxConfig(doc)?.let { config ->
+			val headers = getRequestHeaders().newBuilder()
+				.set("Referer", chapterUrl)
+				.set("X-Requested-With", "XMLHttpRequest")
+				.build()
+
+			val dataKey = config.responseKeys.getString(1)       // "rj060d55fa4391"
+			val imagesKey = config.responseKeys.getString(2)      // "rj8ea926f36da4"
+			val imageKey = config.responseKeys.getString(4)       // "rj85e00919da50"
+			val totalKey = config.responseKeys.getString(6)       // "rjca9c22650203"
+			val nextOffsetKey = config.responseKeys.getString(7)  // "rja9c30b918277"
+			val nextTokenKey = config.responseKeys.getString(8)   // "rjb3e1f5b395ac"
+			val hasMoreKey = config.responseKeys.getString(9)     // "rjfd0394ec019b"
+
+			val allPages = mutableListOf<MangaPage>()
+			val currentForm = LinkedHashMap(config.form)
+
+			while (true) {
+				val response = webClient.httpPost(config.ajaxUrl.toHttpUrl(), currentForm, headers).parseJson()
+				val data = response.optJSONObject(dataKey) ?: break
+				val pages = data.optJSONArray(imagesKey) ?: break
+
+				allPages.addAll(pages.mapJsonPages(imageKey))
+
+				val hasMore = data.optBoolean(hasMoreKey, false)
+				if (!hasMore) break
+
+				val nextOffset = data.optString(nextOffsetKey, "")
+				val nextToken = data.optString(nextTokenKey, "")
+				if (nextOffset.isEmpty()) break
+
+				currentForm[config.fieldOffsetKey] = nextOffset
+				currentForm[config.fieldTokenKey] = nextToken
 			}
+
+			if (allPages.isNotEmpty()) return allPages
 		}
 
 		// Try Base64 encoded data-src
@@ -306,82 +330,135 @@ internal class RaijinScans(context: MangaLoaderContext) :
 			return base64Pages
 		}
 
-		// Fallback: try the old decodeRjAjaxConfig approach
-		decodeRjAjaxConfig(doc)?.let { config ->
-			val headers = getRequestHeaders().newBuilder()
-				.set("Referer", chapterUrl)
-				.set("X-Requested-With", "XMLHttpRequest")
-				.build()
-			val response = webClient.httpPost(config.ajaxUrl.toHttpUrl(), config.form, headers).parseJson()
-			val pages = response
-				.optJSONObject(config.responseKeys.getString(1))
-				?.optJSONArray(config.responseKeys.getString(2))
-				?: JSONArray()
-			val imageKey = config.responseKeys.getString(4)
-			return pages.mapJsonPages(imageKey)
+		// Last resort: partial images from the HTML (may be incomplete due to lazy loading)
+		val loadedImages = doc.select("figure.page img[src], div.reading-content img[src], div.protected-image-data img[src]")
+		if (loadedImages.isNotEmpty()) {
+			return loadedImages.mapNotNull { img ->
+				val imageUrl = img.attr("src").takeIf { it.isNotBlank() } ?: return@mapNotNull null
+				MangaPage(
+					id = generateUid(imageUrl),
+					url = imageUrl,
+					preview = null,
+					source = source,
+				)
+			}
 		}
 
 		return emptyList()
 	}
 
 	private suspend fun loadChapterPagesViaJs(chapterUrl: String): List<MangaPage> {
-		val script = """
+		val loadScript = """
 			(() => {
-				return new Promise(resolve => {
-					const isChallenge = () => {
-						const title = document.title.toLowerCase();
-						return title.includes('just a moment') ||
-							title.includes('un instant') ||
-							title.includes('vérification') ||
-							document.querySelector('script[src*="challenge-platform"]') !== null ||
-							document.querySelector('form[action*="__cf_chl"]') !== null;
+				const isChallenge = () => {
+					const title = document.title.toLowerCase();
+					return title.includes('just a moment') ||
+						title.includes('un instant') ||
+						title.includes('vérification') ||
+						document.querySelector('script[src*="challenge-platform"]') !== null ||
+						document.querySelector('form[action*="__cf_chl"]') !== null;
+				};
+
+				if (isChallenge()) {
+					return "CLOUDFLARE_CHALLENGE";
+				}
+
+				// Initialize state on first poll
+				if (!window.__rjCollector) {
+					window.__rjCollector = {
+						urls: [],
+						seen: new Set(),
+						stableCount: 0,
+						lastCount: 0,
+						startTime: Date.now()
 					};
 
-					const hasImages = () => {
-						return document.querySelectorAll('figure.page img[src], div.reading-content img[src], div.protected-image-data img[src]').length > 0;
-					};
-
-					if (hasImages()) {
-						return resolve(document.documentElement.outerHTML);
-					}
-
-					if (isChallenge()) {
-						return resolve("CLOUDFLARE_CHALLENGE");
-					}
-
-					let attempts = 0;
-					const maxAttempts = 80;
-					const timer = setInterval(() => {
-						attempts++;
-						if (hasImages() || isChallenge() || attempts >= maxAttempts) {
-							clearInterval(timer);
-							resolve(document.documentElement.outerHTML);
+					// Collect existing images
+					document.querySelectorAll('img[src]').forEach(img => {
+						const src = img.getAttribute('src');
+						if (src && src.startsWith('http') && !window.__rjCollector.seen.has(src)) {
+							window.__rjCollector.seen.add(src);
+							window.__rjCollector.urls.push(src);
 						}
-					}, 250);
-				});
+					});
+
+					// MutationObserver to catch images added by AJAX
+					const observer = new MutationObserver((mutations) => {
+						for (const m of mutations) {
+							for (const node of m.addedNodes) {
+								if (node.nodeType !== 1) continue;
+								if (node.tagName === 'IMG') {
+									const src = node.getAttribute('src');
+									if (src && src.startsWith('http') && !window.__rjCollector.seen.has(src)) {
+										window.__rjCollector.seen.add(src);
+										window.__rjCollector.urls.push(src);
+									}
+								}
+								if (node.querySelectorAll) {
+									node.querySelectorAll('img[src]').forEach(img => {
+										const src = img.getAttribute('src');
+										if (src && src.startsWith('http') && !window.__rjCollector.seen.has(src)) {
+											window.__rjCollector.seen.add(src);
+											window.__rjCollector.urls.push(src);
+										}
+									});
+								}
+							}
+						}
+					});
+					observer.observe(document.body, { childList: true, subtree: true });
+				}
+
+				const state = window.__rjCollector;
+
+				// Scroll down to trigger the site's AJAX image loading
+				window.scrollBy(0, window.innerHeight * 2);
+
+				// Check progress
+				if (state.urls.length > state.lastCount) {
+					state.lastCount = state.urls.length;
+					state.stableCount = 0;
+				} else {
+					state.stableCount++;
+				}
+
+				const elapsed = Date.now() - state.startTime;
+
+				// Done if: images stable for 8 polls AND at least 1 image, OR timeout
+				if ((state.stableCount >= 8 && state.urls.length > 0) || elapsed > 80000) {
+					const result = JSON.stringify(state.urls);
+					delete window.__rjCollector;
+					return result;
+				}
+
+				// Keep polling
+				return null;
 			})()
 		""".trimIndent()
 
-		val rawHtml = try {
-			context.evaluateJs(chapterUrl, script, timeout = 30000L)
+		val rawJson = try {
+			context.evaluateJs(chapterUrl, loadScript, timeout = 90000L)
 		} catch (e: Exception) {
 			return emptyList()
 		} ?: return emptyList()
 
-		if (rawHtml == "CLOUDFLARE_CHALLENGE") {
+		if (rawJson == "CLOUDFLARE_CHALLENGE") {
 			return emptyList()
 		}
 
-		val jsDoc = Jsoup.parse(rawHtml, chapterUrl)
-		val images = jsDoc.select("figure.page img[src], div.reading-content img[src], div.protected-image-data img[src]")
-		return images.mapNotNull { img ->
-			val imageUrl = img.attr("src").takeIf { it.isNotBlank() } ?: return@mapNotNull null
-			MangaPage(
-				id = generateUid(imageUrl),
-				url = imageUrl,
-				preview = null,
-				source = source,
-			)
+		return try {
+			val urls = JSONArray(rawJson)
+			(0 until urls.length()).mapNotNull { i ->
+				val imageUrl = urls.optString(i).takeIf { it.isNotBlank() } ?: return@mapNotNull null
+				MangaPage(
+					id = generateUid(imageUrl),
+					url = imageUrl,
+					preview = null,
+					source = source,
+				)
+			}
+		} catch (e: Exception) {
+			emptyList()
 		}
 	}
 
@@ -451,7 +528,13 @@ internal class RaijinScans(context: MangaLoaderContext) :
 		form[fieldNames.getString(7)] = values[9].jsonStringOrEmpty()
 		form[fieldNames.getString(8)] = values[7].jsonStringOrEmpty()
 		form[fieldNames.getString(9)] = empty
-		return RjAjaxConfig(ajaxUrl, form, responseKeys)
+		return RjAjaxConfig(
+			ajaxUrl = ajaxUrl,
+			form = form,
+			responseKeys = responseKeys,
+			fieldOffsetKey = fieldNames.getString(6),  // offset field name
+			fieldTokenKey = fieldNames.getString(9),   // token field name
+		)
 	}
 
 	private fun decodeBase64Chunk(value: String): String {
@@ -529,6 +612,8 @@ internal class RaijinScans(context: MangaLoaderContext) :
 		val ajaxUrl: String,
 		val form: Map<String, String>,
 		val responseKeys: JSONArray,
+		val fieldOffsetKey: String,   // fieldNames[6] - offset field in form data
+		val fieldTokenKey: String,    // fieldNames[9] - token field in form data
 	)
 
 	private companion object {
