@@ -3,15 +3,14 @@ package org.koitharu.kotatsu.parsers.site.likemanga
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
-import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import org.json.JSONObject
+import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
 import org.koitharu.kotatsu.parsers.config.ConfigKey
 import org.koitharu.kotatsu.parsers.core.PagedMangaParser
 import org.koitharu.kotatsu.parsers.model.*
-import org.koitharu.kotatsu.parsers.network.UserAgents
 import org.koitharu.kotatsu.parsers.util.*
 import java.text.DateFormat
 import java.text.SimpleDateFormat
@@ -25,17 +24,11 @@ internal abstract class LikeMangaParser(
 ) : PagedMangaParser(context, source, pageSize) {
 
 	override val configKeyDomain = ConfigKey.Domain(domain)
-	override val userAgentKey = ConfigKey.UserAgent(UserAgents.CHROME_MOBILE)
 
 	override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
 		super.onCreateConfig(keys)
 		keys.add(userAgentKey)
-		keys.add(ConfigKey.InterceptCloudflare(defaultValue = true))
 	}
-
-	override fun getRequestHeaders(): Headers = super.getRequestHeaders().newBuilder()
-		.set("Referer", "https://likemanga.ink/")
-		.build()
 
 	override val availableSortOrders: Set<SortOrder> =
 		EnumSet.of(
@@ -113,7 +106,7 @@ internal abstract class LikeMangaParser(
 			}
 
 		}
-		val doc = webClient.httpGet(url, getRequestHeaders()).parseHtml()
+		val doc = webClient.httpGet(url).parseHtml()
 		return doc.select("div.card-body div.video").map { div ->
 			val href = div.selectFirstOrThrow("a").attrAsRelativeUrl("href")
 			Manga(
@@ -134,7 +127,7 @@ internal abstract class LikeMangaParser(
 	}
 
 	private suspend fun fetchAvailableTags(): Set<MangaTag> {
-		val doc = webClient.httpGet("https://$domain/genres/", getRequestHeaders()).parseHtml()
+		val doc = webClient.httpGet("https://$domain/genres/").parseHtml()
 		return doc.select("ul.nav-genres li:not(.text-center) a").mapToSet { a ->
 			MangaTag(
 				key = a.attr("href").removeSuffix('/').substringAfterLast('/'),
@@ -145,7 +138,7 @@ internal abstract class LikeMangaParser(
 	}
 
 	override suspend fun getDetails(manga: Manga): Manga {
-		val doc = webClient.httpGet(manga.url.toAbsoluteUrl(domain), getRequestHeaders()).parseHtml()
+		val doc = webClient.httpGet(manga.url.toAbsoluteUrl(domain)).parseHtml()
 		val mangaId = manga.url.toAbsoluteUrl(domain).removeSuffix("/").substringAfterLast("-").toInt()
 		val maxPageChapterSelect = doc.getElementById("nav_list_chapter_id_detail")?.select("a:not(.next)")
 		var maxPageChapter = 1
@@ -193,35 +186,10 @@ internal abstract class LikeMangaParser(
 		val json =
 			webClient.httpGet(
 				"https://$domain/?act=ajax&code=load_list_chapter&manga_id=$mangaId&page_num=$page&chap_id=0&keyword=",
-				getRequestHeaders(),
 			)
 				.parseJson().getString("list_chap")
-		val chapters = json.split("wp-manga-chapter").drop(1)
-		return chapters.map { chapter ->
-			val url = chapter.substringAfter("href=\"").substringBefore("\">")
-			val name = chapter.substringAfter("/\">").substringBefore("</a>")
-			val chapNum = url.substringAfter("chapter-").substringBefore("-")
-			val d = chapter.substringAfter("<i>").substringBefore("</i>")
-			val dateText = if (d.contains("New")) {
-				"today"
-			} else {
-				d
-			}
-			MangaChapter(
-				id = generateUid(url),
-				title = name,
-				number = chapNum.toFloatOrNull() ?: 0f,
-				volume = 0,
-				url = url,
-				scanlator = null,
-				uploadDate = parseChapterDate(
-					dateFormat,
-					dateText,
-				),
-				branch = null,
-				source = source,
-			)
-		}
+		val doc = Jsoup.parse(json)
+		return parseChapters(doc)
 	}
 
 	private val dateFormat = SimpleDateFormat("MMMM d, yyyy", Locale.ENGLISH)
@@ -239,7 +207,7 @@ internal abstract class LikeMangaParser(
 				MangaChapter(
 					id = generateUid(url),
 					title = li.selectFirstOrThrow("a").text(),
-					number = chapNum.toFloat(),
+					number = chapNum.toFloatOrNull() ?: 0f,
 					volume = 0,
 					url = url,
 					scanlator = null,
@@ -255,7 +223,7 @@ internal abstract class LikeMangaParser(
 
 	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
 		val fullUrl = chapter.url.toAbsoluteUrl(domain)
-		val doc = webClient.httpGet(fullUrl, getRequestHeaders()).parseHtml()
+		val doc = webClient.httpGet(fullUrl).parseHtml()
 		val testJson = doc.selectFirst("div.reading input#next_img_token")
 		if (testJson != null) {
 			val jsonRaw = testJson.attr("value").split(".")[1]
