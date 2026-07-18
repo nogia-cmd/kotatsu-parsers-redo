@@ -908,8 +908,8 @@ internal class Comix(context: MangaLoaderContext) :
                         const lastPage = Number(
                             meta.lastPage || meta.last_page || meta.totalPages || meta.total_pages || 1
                         ) || 1;
-                        const gid0 = arr[0].groupId != null ? String(arr[0].groupId) : null;
-                        const pure = gid0 != null && arr.every((ch) => String(ch.groupId) === gid0);
+                        const getGroupId = (ch) => { if (ch.groupId != null) return String(ch.groupId); if (ch.group && ch.group.id != null) return String(ch.group.id); if (ch.scanlation_group && ch.scanlation_group.id != null) return String(ch.scanlation_group.id);return null;}; const gid0 = getGroupId(arr[0]);
+                        const pure = gid0 != null && arr.every((ch) => getGroupId(ch) === gid0);
                         if (pure && targetGid != null && gid0 === targetGid) {
                             if (!purePages.has(page)) { purePages.add(page); for (const ch of arr) pureItems.push(ch); }
                             if (lastPage > pureLastPage) pureLastPage = lastPage;
@@ -968,10 +968,10 @@ internal class Comix(context: MangaLoaderContext) :
 
                 // 2) Pick the team that appears most on the first page (tie: newest).
                 const counts = {};
-                for (const ch of mixedItems) { const g = ch.groupId; if (g != null) counts[String(g)] = (counts[String(g)] || 0) + 1; }
+                for (const ch of mixedItems) {const g = getGroupId(ch); if (g != null) counts[g] = (counts[g] || 0) + 1;}
                 let best = null, bestC = -1;
                 for (const g in counts) { if (counts[g] > bestC) { bestC = counts[g]; best = g; } }
-                if (best == null && mixedItems[0] && mixedItems[0].groupId != null) best = String(mixedItems[0].groupId);
+                if (best == null && mixedItems.length > 0) best = getGroupId(mixedItems[0]);
 
                 // 3) Switch the URL to that team and paginate within it.
                 if (best != null) {
