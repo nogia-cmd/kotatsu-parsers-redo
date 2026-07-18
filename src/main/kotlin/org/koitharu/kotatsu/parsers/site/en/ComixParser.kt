@@ -528,10 +528,9 @@ internal class Comix(context: MangaLoaderContext) :
         // and full of duplicates. Pick the single most consistent team (best
         // coverage of the whole range, present at both the newest and oldest
         // chapters) and keep only its chapters, deduplicated per number.
-        val chosenTeam = selectConsistentTeamKey(parsed)
-        val chapters = parsed
-            .filter { chosenTeam == null || teamKeyOf(it) == chosenTeam }
-            .let(::dedupByNumber)
+        // Keep every scanlation team.
+        // Kotatsu will separate them using the branch field.
+        val chapters = dedupByNumberAndBranch(parsed)
 
         val chaptersBuilder = ChaptersListBuilder(chapters.size)
         for (chapterData in chapters) {
