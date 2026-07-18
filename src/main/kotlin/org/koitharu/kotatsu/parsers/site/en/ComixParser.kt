@@ -25,7 +25,7 @@ import java.nio.charset.StandardCharsets
 import java.util.*
 import java.util.concurrent.ConcurrentHashMap
 
-@MangaSourceParser("COMIX", "Comix_1", "en", ContentType.MANGA)
+@MangaSourceParser("COMIX", "Comix", "en", ContentType.MANGA)
 internal class Comix(context: MangaLoaderContext) :
     PagedMangaParser(context, MangaParserSource.COMIX, 28) {
 
@@ -528,9 +528,10 @@ internal class Comix(context: MangaLoaderContext) :
         // and full of duplicates. Pick the single most consistent team (best
         // coverage of the whole range, present at both the newest and oldest
         // chapters) and keep only its chapters, deduplicated per number.
-        // Keep every scanlation team.
-        // Kotatsu will separate them using the branch field.
-        val chapters = dedupByNumberAndBranch(parsed)
+        val chosenTeam = selectConsistentTeamKey(parsed)
+        val chapters = parsed
+            .filter { chosenTeam == null || teamKeyOf(it) == chosenTeam }
+            .let(::dedupByNumber)
 
         val chaptersBuilder = ChaptersListBuilder(chapters.size)
         for (chapterData in chapters) {
@@ -613,34 +614,23 @@ internal class Comix(context: MangaLoaderContext) :
     }
 
     /** Keep one chapter per number, preferring the most-voted (then newest id). */
-    private fun dedupByNumberAndBranch(chapters: List<JSONObject>): List<JSONObject> {
-    val map = LinkedHashMap<Pair<String, Double>, JSONObject>()
-
-    for (chapter in chapters) {
-        val number = chapter.optDouble("number", 0.0)
-        val branch = teamKeyOf(chapter)
-
-        val key = branch to number
-        val current = map[key]
-
-        if (current == null) {
-            map[key] = chapter
-        } else {
-            val newVotes = chapter.optLong("votes", 0L)
-            val curVotes = current.optLong("votes", 0L)
-
-            val better = newVotes > curVotes ||
-                (newVotes == curVotes &&
-                    chapter.optLong("id", 0L) > current.optLong("id", 0L))
-
-            if (better) {
-                map[key] = chapter
+    private fun dedupByNumber(chapters: List<JSONObject>): List<JSONObject> {
+        val byNumber = LinkedHashMap<Double, JSONObject>()
+        for (chapter in chapters) {
+            val number = chapter.optDouble("number", 0.0)
+            val current = byNumber[number]
+            if (current == null) {
+                byNumber[number] = chapter
+            } else {
+                val newVotes = chapter.optLong("votes", 0L)
+                val curVotes = current.optLong("votes", 0L)
+                val better = newVotes > curVotes ||
+                    (newVotes == curVotes && chapter.optLong("id", 0L) > current.optLong("id", 0L))
+                if (better) byNumber[number] = chapter
             }
         }
+        return byNumber.values.toList()
     }
-
-    return map.values.toList()
-}
 
     private suspend fun loadAllChapters(hashId: String): JSONArray {
         val titleUrl = "https://$domain/title/$hashId"
@@ -908,8 +898,8 @@ internal class Comix(context: MangaLoaderContext) :
                         const lastPage = Number(
                             meta.lastPage || meta.last_page || meta.totalPages || meta.total_pages || 1
                         ) || 1;
-                        const getGroupId = (ch) => { if (ch.groupId != null) return String(ch.groupId); if (ch.group && ch.group.id != null) return String(ch.group.id); if (ch.scanlation_group && ch.scanlation_group.id != null) return String(ch.scanlation_group.id);return null;}; const gid0 = getGroupId(arr[0]);
-                        const pure = gid0 != null && arr.every((ch) => getGroupId(ch) === gid0);
+                        const gid0 = arr[0].groupId != null ? String(arr[0].groupId) : null;
+                        const pure = gid0 != null && arr.every((ch) => String(ch.groupId) === gid0);
                         if (pure && targetGid != null && gid0 === targetGid) {
                             if (!purePages.has(page)) { purePages.add(page); for (const ch of arr) pureItems.push(ch); }
                             if (lastPage > pureLastPage) pureLastPage = lastPage;
@@ -968,10 +958,10 @@ internal class Comix(context: MangaLoaderContext) :
 
                 // 2) Pick the team that appears most on the first page (tie: newest).
                 const counts = {};
-                for (const ch of mixedItems) {const g = getGroupId(ch); if (g != null) counts[g] = (counts[g] || 0) + 1; }
+                for (const ch of mixedItems) { const g = ch.groupId; if (g != null) counts[String(g)] = (counts[String(g)] || 0) + 1; }
                 let best = null, bestC = -1;
                 for (const g in counts) { if (counts[g] > bestC) { bestC = counts[g]; best = g; } }
-                if (best == null && mixedItems.length > 0) best = getGroupId(mixedItems[0]);
+                if (best == null && mixedItems[0] && mixedItems[0].groupId != null) best = String(mixedItems[0].groupId);
 
                 // 3) Switch the URL to that team and paginate within it.
                 if (best != null) {
