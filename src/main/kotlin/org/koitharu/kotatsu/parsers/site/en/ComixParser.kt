@@ -613,23 +613,34 @@ internal class Comix(context: MangaLoaderContext) :
     }
 
     /** Keep one chapter per number, preferring the most-voted (then newest id). */
-    private fun dedupByNumber(chapters: List<JSONObject>): List<JSONObject> {
-        val byNumber = LinkedHashMap<Double, JSONObject>()
-        for (chapter in chapters) {
-            val number = chapter.optDouble("number", 0.0)
-            val current = byNumber[number]
-            if (current == null) {
-                byNumber[number] = chapter
-            } else {
-                val newVotes = chapter.optLong("votes", 0L)
-                val curVotes = current.optLong("votes", 0L)
-                val better = newVotes > curVotes ||
-                    (newVotes == curVotes && chapter.optLong("id", 0L) > current.optLong("id", 0L))
-                if (better) byNumber[number] = chapter
+    private fun dedupByNumberAndBranch(chapters: List<JSONObject>): List<JSONObject> {
+    val map = LinkedHashMap<Pair<String, Double>, JSONObject>()
+
+    for (chapter in chapters) {
+        val number = chapter.optDouble("number", 0.0)
+        val branch = teamKeyOf(chapter)
+
+        val key = branch to number
+        val current = map[key]
+
+        if (current == null) {
+            map[key] = chapter
+        } else {
+            val newVotes = chapter.optLong("votes", 0L)
+            val curVotes = current.optLong("votes", 0L)
+
+            val better = newVotes > curVotes ||
+                (newVotes == curVotes &&
+                    chapter.optLong("id", 0L) > current.optLong("id", 0L))
+
+            if (better) {
+                map[key] = chapter
             }
         }
-        return byNumber.values.toList()
     }
+
+    return map.values.toList()
+}
 
     private suspend fun loadAllChapters(hashId: String): JSONArray {
         val titleUrl = "https://$domain/title/$hashId"
