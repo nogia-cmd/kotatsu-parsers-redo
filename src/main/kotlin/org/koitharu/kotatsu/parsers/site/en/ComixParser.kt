@@ -894,6 +894,12 @@ internal class Comix(context: MangaLoaderContext) :
                 let pureLastPage = 1;
                 let sawMixed = false;
 
+                const getGroupId = (ch) => {
+                    if (ch.groupId != null) return String(ch.groupId);
+                    if (ch.group && ch.group.id != null) return String(ch.group.id);
+                    if (ch.scanlation_group && ch.scanlation_group.id != null) return String(ch.scanlation_group.id);
+                    return null;
+                };
                 const isChapters = (arr) =>
                     Array.isArray(arr) && arr.length > 0 && arr[0] &&
                     arr[0].id !== undefined && arr[0].number !== undefined;
@@ -908,7 +914,7 @@ internal class Comix(context: MangaLoaderContext) :
                         const lastPage = Number(
                             meta.lastPage || meta.last_page || meta.totalPages || meta.total_pages || 1
                         ) || 1;
-                        const getGroupId = (ch) => { if (ch.groupId != null) return String(ch.groupId); if (ch.group && ch.group.id != null) return String(ch.group.id); if (ch.scanlation_group && ch.scanlation_group.id != null) return String(ch.scanlation_group.id);return null;}; const gid0 = getGroupId(arr[0]);
+                        const gid0 = getGroupId(arr[0]);
                         const pure = gid0 != null && arr.every((ch) => getGroupId(ch) === gid0);
                         if (pure && targetGid != null && gid0 === targetGid) {
                             if (!purePages.has(page)) { purePages.add(page); for (const ch of arr) pureItems.push(ch); }
