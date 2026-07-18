@@ -25,7 +25,7 @@ import java.nio.charset.StandardCharsets
 import java.util.*
 import java.util.concurrent.ConcurrentHashMap
 
-@MangaSourceParser("COMIX", "Comix", "en", ContentType.MANGA)
+@MangaSourceParser("COMIX", "Comix_1", "en", ContentType.MANGA)
 internal class Comix(context: MangaLoaderContext) :
     PagedMangaParser(context, MangaParserSource.COMIX, 28) {
 
@@ -968,7 +968,7 @@ internal class Comix(context: MangaLoaderContext) :
 
                 // 2) Pick the team that appears most on the first page (tie: newest).
                 const counts = {};
-                for (const ch of mixedItems) {const g = getGroupId(ch); if (g != null) counts[g] = (counts[g] || 0) + 1;}
+                for (const ch of mixedItems) {const g = getGroupId(ch); if (g != null) counts[g] = (counts[g] || 0) + 1; }
                 let best = null, bestC = -1;
                 for (const g in counts) { if (counts[g] > bestC) { bestC = counts[g]; best = g; } }
                 if (best == null && mixedItems.length > 0) best = getGroupId(mixedItems[0]);
