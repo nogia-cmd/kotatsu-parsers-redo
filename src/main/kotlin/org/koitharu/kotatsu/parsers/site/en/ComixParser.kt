@@ -579,39 +579,6 @@ internal class Comix(context: MangaLoaderContext) :
             ?: if (chapter.optBoolean("isOfficial")) "Official" else "Unknown"
     }
 
-    /**
-     * Picks the most consistent scanlation team to read a series with: the one
-     * covering the most distinct chapter numbers, tie-broken by reaching the
-     * latest chapter, then the earliest, then total votes. This favours a team
-     * that scanlated the whole run end-to-end over one that did a few chapters.
-     */
-    private fun selectConsistentTeamKey(chapters: List<JSONObject>): String? {
-        if (chapters.isEmpty()) return null
-        val globalMax = chapters.maxOf { it.optDouble("number", 0.0) }
-
-        val numbers = HashMap<String, MutableSet<Double>>()
-        val minNumber = HashMap<String, Double>()
-        val maxNumber = HashMap<String, Double>()
-        val votes = HashMap<String, Long>()
-        for (chapter in chapters) {
-            val key = teamKeyOf(chapter)
-            val number = chapter.optDouble("number", 0.0)
-            numbers.getOrPut(key) { HashSet() }.add(number)
-            minNumber[key] = minOf(minNumber[key] ?: Double.MAX_VALUE, number)
-            maxNumber[key] = maxOf(maxNumber[key] ?: -Double.MAX_VALUE, number)
-            votes[key] = (votes[key] ?: 0L) + chapter.optLong("votes", 0L)
-        }
-
-        return numbers.keys.maxWithOrNull(
-            compareBy(
-                { numbers.getValue(it).size },
-                { if ((maxNumber[it] ?: 0.0) >= globalMax) 1 else 0 },
-                { -(minNumber[it] ?: 0.0) },
-                { votes[it] ?: 0L },
-            ),
-        )
-    }
-
     /** Keep one chapter per number, preferring the most-voted (then newest id). */
     private fun dedupByNumberAndBranch(chapters: List<JSONObject>): List<JSONObject> {
     val map = LinkedHashMap<Pair<String, Double>, JSONObject>()
@@ -646,11 +613,12 @@ internal class Comix(context: MangaLoaderContext) :
         val titleUrl = "https://$domain/title/$hashId"
 
         // Let the title page fetch (and decrypt) its chapter list and capture what
-        // it parses. The script prefers the fast single-team path: it reads the
-        // dominant team off the first page, then sets `?group_id=<id>` on the URL
-        // (the SPA reads it and refetches just that team), and paginates within it.
-        // If the URL filter doesn't take, it falls back to paginating every team.
-        val response = evaluateWebViewApiJson(titleUrl, CHAPTER_SCRIPT)
+        // it parses, paginating through the full, all-teams list via the "Next"
+        // button so every scanlation group survives (Kotatsu splits them by
+        // branch downstream in dedupByNumberAndBranch/getChapters). A popular
+        // series can have hundreds of combined chapters across many teams, so
+        // this gets a much longer timeout than browse/page-list lookups.
+        val response = evaluateWebViewApiJson(titleUrl, CHAPTER_SCRIPT, timeoutMs = WEBVIEW_CHAPTERS_TIMEOUT)
         return response.optJSONArray("items") ?: JSONArray()
     }
 
@@ -667,13 +635,17 @@ internal class Comix(context: MangaLoaderContext) :
 
     private fun apiUrl(path: String): String = "https://$domain/api/v1/${path.removePrefix("/")}"
 
-    private suspend fun evaluateWebViewApiJson(pageUrl: String, script: String): JSONObject {
+    private suspend fun evaluateWebViewApiJson(
+        pageUrl: String,
+        script: String,
+        timeoutMs: Long = WEBVIEW_API_TIMEOUT,
+    ): JSONObject {
         val bridgeScript = buildWebViewApiBridgeScript(script)
         val requests = runCatching {
             context.interceptWebViewRequests(
                 pageUrl,
                 InterceptionConfig(
-                    timeoutMs = WEBVIEW_API_TIMEOUT,
+                    timeoutMs = timeoutMs,
                     maxRequests = 1,
                     urlPattern = INTERCEPT_URL_REGEX,
                     pageScript = bridgeScript,
@@ -866,6 +838,7 @@ internal class Comix(context: MangaLoaderContext) :
         private const val ENC_INCREMENT = 1234567891
         private val RELATIVE_DATE_REGEX = Regex("""^(\d+)\s*(s|m|h|d|w|mo|mos|y|yr|yrs|min|mins|sec|secs|hr|hrs|day|days|week|weeks|month|months|year|years)$""")
         private const val WEBVIEW_API_TIMEOUT = 90000L
+        private const val WEBVIEW_CHAPTERS_TIMEOUT = 300000L
         private const val CLOUDFLARE_BLOCKED = "CLOUDFLARE_BLOCKED"
         private const val INTERCEPT_RESULT_URL = "https://kotatsu.intercept/result"
         private const val INTERCEPT_ERROR_URL = "https://kotatsu.intercept/error"
@@ -876,52 +849,58 @@ internal class Comix(context: MangaLoaderContext) :
         private const val WEBVIEW_PAGE_ATTEMPTS = 3
         private const val WEBVIEW_PAGE_TIMEOUT = 20000L
 
-        // Loads the chapter list, preferring a single team. It reads the dominant
-        // team off the all-teams first page, then switches the URL to that team's
-        // `?group_id=<id>` (pushState + popstate, which the SPA reads and refetches),
-        // and paginates within that team via the "Next" button. If the URL filter
-        // never yields a single-team response it falls back to paginating all teams.
+        // Loads the full, all-teams chapter list (every scanlation group kept,
+        // not narrowed to a single one — Kotatsu surfaces each group as its
+        // own branch/tab via MangaChapter.branch). The title page itself
+        // calls `/api/v1/manga/{hid}/groups` on load, listing every group
+        // that exists for the manga (e.g. `{result:{items:[{id,name,slug}]}}`).
+        // We can't call that endpoint directly (unsigned requests get
+        // blocked), but we capture it from this same WebView session and use
+        // "have we seen a chapter from every known group id yet" as a real
+        // completion signal — pagination stops quickly once true, and stays
+        // patient otherwise, instead of only ever guessing off a stall timer.
         // Resolves with `{ items: [...] }`.
         private const val CHAPTER_SCRIPT = """
             (async () => {
                 const original = JSON.parse;
                 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-                const mixedItems = [];
-                const mixedSeen = new Set();
-                const pureItems = [];
-                const purePages = new Set();
-                let targetGid = null;
-                let pureLastPage = 1;
-                let sawMixed = false;
+                const items = [];
+                const seenPages = new Set();
+                const knownGroupIds = new Set();
+                const seenGroupIds = new Set();
+                const startTs = Date.now();
+                const DEADLINE_MS = 280000;
 
-                const getGroupId = (ch) => {
-                    if (ch.groupId != null) return String(ch.groupId);
-                    if (ch.group && ch.group.id != null) return String(ch.group.id);
-                    if (ch.scanlation_group && ch.scanlation_group.id != null) return String(ch.scanlation_group.id);
-                    return null;
-                };
                 const isChapters = (arr) =>
                     Array.isArray(arr) && arr.length > 0 && arr[0] &&
                     arr[0].id !== undefined && arr[0].number !== undefined;
+
+                const isGroups = (arr) =>
+                    Array.isArray(arr) && arr.length > 0 && arr[0] &&
+                    arr[0].id !== undefined && arr[0].number === undefined &&
+                    (arr[0].name !== undefined || arr[0].slug !== undefined);
+
+                const groupIdOf = (ch) => {
+                    if (ch.groupId != null) return String(ch.groupId);
+                    if (ch.group && ch.group.id != null) return String(ch.group.id);
+                    if (ch.scanlation_group && ch.scanlation_group.id != null) return String(ch.scanlation_group.id);
+                    return '0';
+                };
 
                 const onParsed = (parsed) => {
                     try {
                         const result = parsed && parsed.result ? parsed.result : parsed;
                         const arr = result && result.items;
+                        if (isGroups(arr)) {
+                            for (const g of arr) knownGroupIds.add(String(g.id));
+                            return;
+                        }
                         if (!isChapters(arr)) return;
                         const meta = (result.meta || result.pagination) || {};
                         const page = Number(meta.page || 1);
-                        const lastPage = Number(
-                            meta.lastPage || meta.last_page || meta.totalPages || meta.total_pages || 1
-                        ) || 1;
-                        const gid0 = getGroupId(arr[0]);
-                        const pure = gid0 != null && arr.every((ch) => getGroupId(ch) === gid0);
-                        if (pure && targetGid != null && gid0 === targetGid) {
-                            if (!purePages.has(page)) { purePages.add(page); for (const ch of arr) pureItems.push(ch); }
-                            if (lastPage > pureLastPage) pureLastPage = lastPage;
-                        } else if (!pure) {
-                            sawMixed = true;
-                            if (!mixedSeen.has(page)) { mixedSeen.add(page); for (const ch of arr) mixedItems.push(ch); }
+                        if (!seenPages.has(page)) {
+                            seenPages.add(page);
+                            for (const ch of arr) { items.push(ch); seenGroupIds.add(groupIdOf(ch)); }
                         }
                     } catch (e) {}
                 };
@@ -942,17 +921,6 @@ internal class Comix(context: MangaLoaderContext) :
                     return os.apply(this, arguments);
                 };
 
-                const setGroup = (gid) => {
-                    try {
-                        const u = new URL(window.location.href);
-                        if (gid == null) u.searchParams.delete('group_id');
-                        else u.searchParams.set('group_id', String(gid));
-                        u.searchParams.delete('page');
-                        history.pushState({}, '', u.pathname + (u.search || ''));
-                        window.dispatchEvent(new PopStateEvent('popstate'));
-                    } catch (e) {}
-                };
-
                 const clickNext = (onFail) => {
                     let tries = 0;
                     const iv = setInterval(() => {
@@ -965,51 +933,36 @@ internal class Comix(context: MangaLoaderContext) :
                             }
                         }
                         if (btn && !btn.disabled) { btn.click(); clearInterval(iv); }
-                        else if (++tries > 40) { clearInterval(iv); if (onFail) onFail(); }
+                        else if (++tries > 150) { clearInterval(iv); if (onFail) onFail(); }
                     }, 100);
                 };
 
-                // 1) Wait for the page's own all-teams first request.
-                for (let i = 0; i < 150 && !sawMixed; i++) await sleep(100);
+                // 1) Wait for the page's own first request(s) — groups and/or
+                // the first chapter page usually arrive together.
+                for (let i = 0; i < 150 && items.length === 0; i++) await sleep(100);
 
-                // 2) Pick the team that appears most on the first page (tie: newest).
-                const counts = {};
-                for (const ch of mixedItems) {const g = getGroupId(ch); if (g != null) counts[g] = (counts[g] || 0) + 1;}
-                let best = null, bestC = -1;
-                for (const g in counts) { if (counts[g] > bestC) { bestC = counts[g]; best = g; } }
-                if (best == null && mixedItems.length > 0) best = getGroupId(mixedItems[0]);
-
-                // 3) Switch the URL to that team and paginate within it.
-                if (best != null) {
-                    targetGid = best;
-                    setGroup(best);
-                    let got = false;
-                    for (let i = 0; i < 70; i++) { if (purePages.size > 0) { got = true; break; } await sleep(100); }
-                    if (got) {
-                        let last = Date.now(), lastN = pureItems.length, stop = false;
-                        clickNext(() => { stop = true; });
-                        for (let i = 0; i < 900; i++) {
-                            if (purePages.size >= Math.min(pureLastPage, 300)) break;
-                            if (pureItems.length !== lastN) { lastN = pureItems.length; last = Date.now(); stop = false; if (purePages.size < 300) clickNext(() => { stop = true; }); }
-                            if (stop && (Date.now() - last) > 3000) break;
-                            if ((Date.now() - last) > 12000) break;
-                            await sleep(100);
-                        }
-                        if (pureItems.length > 0) return JSON.stringify({ items: pureItems });
-                    }
-                }
-
-                // 4) Fallback: paginate every team via the "Next" button.
-                setGroup(null);
-                let last = Date.now(), lastN = mixedItems.length, stop = false;
+                // 2) Paginate through every team via the "Next" button.
+                // Once every known group id has shown up at least once, stop
+                // as soon as things stall briefly; otherwise stay patient —
+                // we know for a fact there's more to find.
+                let last = Date.now(), lastN = items.length, stop = false;
                 clickNext(() => { stop = true; });
-                for (let i = 0; i < 800; i++) {
-                    if (mixedItems.length !== lastN) { lastN = mixedItems.length; last = Date.now(); stop = false; if (mixedSeen.size < 250) clickNext(() => { stop = true; }); }
-                    if (stop && (Date.now() - last) > 3000) break;
-                    if (mixedItems.length > 0 && (Date.now() - last) > 9000) break;
+                while (Date.now() - startTs < DEADLINE_MS) {
+                    if (items.length !== lastN) {
+                        lastN = items.length;
+                        last = Date.now();
+                        stop = false;
+                        if (seenPages.size < 3000) clickNext(() => { stop = true; });
+                    }
+                    const allGroupsSeen = knownGroupIds.size > 0 &&
+                        Array.from(knownGroupIds).every((g) => seenGroupIds.has(g));
+                    const stallLimit = allGroupsSeen ? 4000 : 10000;
+                    const idleLimit = allGroupsSeen ? 8000 : 20000;
+                    if (stop && (Date.now() - last) > stallLimit) break;
+                    if (items.length > 0 && (Date.now() - last) > idleLimit) break;
                     await sleep(100);
                 }
-                return JSON.stringify({ items: mixedItems });
+                return JSON.stringify({ items: items });
             })()
         """
 
