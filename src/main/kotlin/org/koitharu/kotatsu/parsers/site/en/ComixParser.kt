@@ -612,15 +612,125 @@ internal class Comix(context: MangaLoaderContext) :
     private suspend fun loadAllChapters(hashId: String): JSONArray {
         val titleUrl = "https://$domain/title/$hashId"
 
-        // Let the title page fetch (and decrypt) its chapter list and capture what
-        // it parses, paginating through the full, all-teams list via the "Next"
-        // button so every scanlation group survives (Kotatsu splits them by
-        // branch downstream in dedupByNumberAndBranch/getChapters). A popular
-        // series can have hundreds of combined chapters across many teams, so
-        // this gets a much longer timeout than browse/page-list lookups.
-        val response = evaluateWebViewApiJson(titleUrl, CHAPTER_SCRIPT, timeoutMs = WEBVIEW_CHAPTERS_TIMEOUT)
-        return response.optJSONArray("items") ?: JSONArray()
+        // The reader page's own chapter-index UI reveals the real endpoint:
+        // GET /api/v1/manga/{hid}/chapters?limit=30&order[number]=desc
+        //     [&group_id=<id>]&page=<n>&_=<cache-buster>
+        // It's paginated at a fixed 30/page and works with or without
+        // group_id, so we can drive it directly from inside the WebView
+        // (which already carries valid Cloudflare-cleared cookies) instead
+        // of relying on clicking "Next" and hoping the SPA issues the right
+        // request. Completion is a hard fact per group (a short page = done),
+        // not a stall-based guess.
+        val direct = evaluateWebViewApiJson(
+            titleUrl,
+            buildDirectChapterFetchScript(hashId),
+            timeoutMs = WEBVIEW_CHAPTERS_TIMEOUT,
+        )
+        val directItems = direct.optJSONArray("items")
+        if (directItems != null && directItems.length() > 0) {
+            return directItems
+        }
+
+        // Fallback for the rare case the direct calls come back empty (e.g.
+        // an unexpected block): let the page paginate itself via its own
+        // "Next" button, across all teams.
+        val fallback = evaluateWebViewApiJson(titleUrl, CHAPTER_SCRIPT, timeoutMs = WEBVIEW_CHAPTERS_TIMEOUT)
+        val fallbackItems = fallback.optJSONArray("items")
+        if (fallbackItems != null && fallbackItems.length() > 0) {
+            return fallbackItems
+        }
+
+        // Both attempts genuinely returned nothing — surface it as an error
+        // instead of quietly showing "0 chapters", and include whatever
+        // diagnostics the direct-fetch pass collected (HTTP statuses seen,
+        // parse failures, groups discovered) to make the next fix concrete.
+        val debug = direct.optJSONObject("debug")
+        throw ParseException("Comix returned no chapters for this title (debug: $debug)", titleUrl)
     }
+
+    // Builds the direct-fetch chapter script for a specific manga hashId.
+    // Discovers every real group via /groups, then pages through
+    // /chapters?group_id=<id>&page=<n> for each one until a short page (or
+    // an empty one) proves that group is exhausted. Waits for the page's own
+    // bootstrap (including Cloudflare's client-side clearance) to settle
+    // before firing anything, and retries a request a few times if it comes
+    // back as HTML (a challenge page) instead of JSON.
+    private fun buildDirectChapterFetchScript(hashId: String): String {
+        val safeHashId = hashId.replace("\\", "\\\\").replace("\"", "\\\"")
+        return """
+            (async () => {
+                const startTs = Date.now();
+                const DEADLINE_MS = 260000;
+                const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+                const hashId = "$safeHashId";
+                const items = [];
+                const debug = { statuses: {}, parseFailures: 0, networkErrors: 0, groupsFound: 0 };
+
+                const randomToken = () => Math.random().toString(36).slice(2) + Date.now().toString(36);
+
+                const fetchJson = async (url) => {
+                    for (let attempt = 0; attempt < 4; attempt++) {
+                        try {
+                            const res = await fetch(url, { credentials: 'include' });
+                            debug.statuses[res.status] = (debug.statuses[res.status] || 0) + 1;
+                            const text = await res.text();
+                            try {
+                                return JSON.parse(text);
+                            } catch (e) {
+                                debug.parseFailures++;
+                            }
+                        } catch (e) {
+                            debug.networkErrors++;
+                        }
+                        await sleep(1000 * (attempt + 1));
+                    }
+                    return null;
+                };
+
+                // 1) Let the page's own bootstrap — including Cloudflare's
+                // client-side clearance cookie — finish settling before we
+                // fire any requests of our own. Firing immediately on script
+                // injection risks hitting a still-unresolved challenge.
+                if (document.readyState !== 'complete') {
+                    await new Promise((resolve) => {
+                        window.addEventListener('load', resolve, { once: true });
+                        setTimeout(resolve, 8000);
+                    });
+                }
+                await sleep(3000);
+
+                // 2) Discover every real group for this manga.
+                const groupsResp = await fetchJson(
+                    window.location.origin + '/api/v1/manga/' + hashId + '/groups?_=' + randomToken()
+                );
+                const groups = (groupsResp && groupsResp.result && groupsResp.result.items) || [];
+                const groupIds = groups.map((g) => g.id);
+                if (groupIds.indexOf(0) === -1) groupIds.push(0);
+                debug.groupsFound = groups.length;
+
+                // 3) Page through every group directly.
+                const LIMIT = 30;
+                for (const gid of groupIds) {
+                    if (Date.now() - startTs > DEADLINE_MS) break;
+                    let page = 1;
+                    while (Date.now() - startTs < DEADLINE_MS) {
+                        const url = window.location.origin + '/api/v1/manga/' + hashId + '/chapters?limit=' + LIMIT +
+                            '&order[number]=desc&group_id=' + gid + '&page=' + page + '&_=' + randomToken();
+                        const resp = await fetchJson(url);
+                        const arr = resp && resp.result && resp.result.items;
+                        if (!Array.isArray(arr) || arr.length === 0) break;
+                        for (const ch of arr) items.push(ch);
+                        if (arr.length < LIMIT) break;
+                        page += 1;
+                        await sleep(80);
+                    }
+                }
+
+                return JSON.stringify({ items: items, debug: debug });
+            })()
+        """
+    }
+
 
     private fun extractInitialDataPages(document: Document): JSONObject? {
         val raw = document.selectFirst("script#initial-data")?.data()?.nullIfEmpty() ?: return null
